@@ -1,0 +1,25 @@
+# deps / build
+node_modules/
+dist/
+*.tsbuildinfo
+mac-usage-menubar/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# runtime data
+*.log
+logs/
+sessions.json
+delivery-state.json
+bridge.pid
+.feishu-claude-bridge/
+
+# OS / IDE
+.DS_Store
+.claude/
+.vscode/
+.idea/
+*.swp

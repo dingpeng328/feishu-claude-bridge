@@ -1,0 +1,27 @@
+{
+  "name": "feishu-claude-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin bridge: Feishu topic thread ↔ local Claude/Codex CLI (chat-only)",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "dev": "tsx watch src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "file:vendor/larksuiteoapi-node-sdk",
+    "dotenv": "^16.4.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
