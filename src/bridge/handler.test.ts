@@ -7,6 +7,7 @@ vi.mock("../claude/runner.js", () => ({ runAgent: (opts: unknown) => runAgentMoc
 
 import { BridgeHandler } from "./handler.js";
 import type { LarkMessageEvent } from "../lark/transport.js";
+import type { ThreadContextMessage } from "../lark/channel.js";
 import { SessionStore } from "../claude/sessionStore.js";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,6 +50,7 @@ function makeDeps(events: LarkMessageEvent[]) {
     })),
   };
   const client = {
+    getThreadContext: vi.fn(async (): Promise<ThreadContextMessage[]> => []),
     async *events(): AsyncIterable<LarkMessageEvent> {
       for (const e of events) yield e;
     },
@@ -136,6 +138,55 @@ describe("BridgeHandler.handleOne", () => {
     expect(deps.cardRenderer.start).toHaveBeenCalledWith("om_top", { replyInThread: true });
     expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "答案是 4" });
     expect(store.get("om_top")?.sessionId).toBe("sess_new");
+  });
+
+  it("pulls the whole group topic before answering an in-thread @mention", async () => {
+    runAgentMock.mockReturnValue(
+      fakeRun([{ type: "text_delta", text: "综合回复", raw: { message: { id: "m1" } } }]),
+    );
+    const current = inThreadReply("om_3", "om_root", "请综合一下", true);
+    const deps = makeDeps([current]);
+    deps.client.getThreadContext.mockResolvedValue([
+      {
+        messageId: "om_root",
+        senderId: "ou_a",
+        createTime: "1",
+        msgType: "text",
+        text: "背景：发布失败",
+      },
+      {
+        messageId: "om_2",
+        senderId: "ou_b",
+        createTime: "2",
+        msgType: "text",
+        text: "普通讨论，没有 @ 机器人",
+      },
+      {
+        messageId: "om_3",
+        senderId: "ou_s",
+        createTime: "3",
+        msgType: "text",
+        text: "请综合一下",
+      },
+      {
+        messageId: "om_card",
+        senderId: "ou_bot",
+        createTime: "4",
+        msgType: "interactive",
+        text: "[interactive消息]",
+      },
+    ]);
+
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+
+    expect(deps.client.getThreadContext).toHaveBeenCalledWith("omt_x", "om_root", current);
+    const prompt = String(runAgentMock.mock.calls[0]?.[0]?.prompt);
+    expect(prompt).toContain("背景：发布失败");
+    expect(prompt).toContain("普通讨论，没有 @ 机器人");
+    expect(prompt).toContain("请综合全部讨论，重点回答当前消息");
+    expect(prompt).not.toContain("[interactive消息]");
+    expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "综合回复" });
   });
 
   it("retries without resume on stale session, then succeeds", async () => {
@@ -230,6 +281,7 @@ function makeMultiCardDeps(events: LarkMessageEvent[]) {
     }),
   };
   const client = {
+    getThreadContext: vi.fn(async (): Promise<ThreadContextMessage[]> => []),
     async *events(): AsyncIterable<LarkMessageEvent> {
       yield events[0]!;
       await delay(60); // let turn 1 start + reach the await before turn 2 arrives

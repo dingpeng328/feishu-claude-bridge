@@ -64,13 +64,13 @@ function extractPostText(value: unknown): string {
   return "";
 }
 
-/** Parse event.content (a JSON string) and extract plain text (text / post). */
-function extractText(event: LarkMessageEvent): string {
+/** Parse a Feishu message body JSON string and extract readable text. */
+export function extractMessageText(content: string): string {
   let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(event.content) as Record<string, unknown>;
+    parsed = JSON.parse(content) as Record<string, unknown>;
   } catch {
-    return stripAtPlaceholders(event.content);
+    return stripAtPlaceholders(content);
   }
 
   let raw = "";
@@ -84,6 +84,9 @@ function extractText(event: LarkMessageEvent): string {
     // post with a top-level locale key (zh_cn / en_us / ...)
     const locale = parsed["zh_cn"] ?? parsed["en_us"] ?? parsed["zh_hk"] ?? parsed["ja_jp"];
     if (locale !== undefined) raw = extractPostText(locale);
+    // Interactive cards and a few other structured message bodies keep their
+    // readable markdown under `elements` rather than `content`.
+    else raw = extractPostText(parsed);
   }
 
   return stripAtPlaceholders(raw.trim());
@@ -95,7 +98,7 @@ export function parseMessage(event: LarkMessageEvent): ParsedMessage {
     chatId: event.chat_id,
     messageId: event.message_id,
     senderOpenId: event.sender_id,
-    text: extractText(event),
+    text: extractMessageText(event.content),
     raw: event,
   };
 }

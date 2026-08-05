@@ -1,5 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
+  ChannelClient,
   channelMsgToLarkEvent,
   apiMessageToLarkEvent,
   resolveStaleMs,
@@ -9,6 +10,7 @@ import {
   resolveCatchUpLookbackMs,
   shouldRebuildChannel,
 } from "./channel.js";
+import type { LarkMessageEvent } from "./transport.js";
 
 describe("resolveStaleMs", () => {
   it("uses ctor value when given", () => {
@@ -191,5 +193,91 @@ describe("apiMessageToLarkEvent", () => {
 
   it("ignores history messages that do not mention this bot", () => {
     expect(apiMessageToLarkEvent(item, "ou_other_bot")).toBeNull();
+  });
+});
+
+describe("ChannelClient.getThreadContext", () => {
+  it("merges the root, paginates all replies, deduplicates, and keeps the current event", async () => {
+    const get = vi.fn(async () => ({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_root",
+            thread_id: "omt_real",
+            msg_type: "text",
+            create_time: "1000",
+            sender: { id: "ou_a", sender_name: "Alice" },
+            body: { content: JSON.stringify({ text: "根消息" }) },
+          },
+        ],
+      },
+    }));
+    const list = vi
+      .fn()
+      .mockResolvedValueOnce({
+        code: 0,
+        data: {
+          has_more: true,
+          page_token: "next",
+          items: [
+            {
+              message_id: "om_root",
+              msg_type: "text",
+              create_time: "1000",
+              sender: { id: "ou_a" },
+              body: { content: JSON.stringify({ text: "重复根消息" }) },
+            },
+            {
+              message_id: "om_2",
+              msg_type: "text",
+              create_time: "2000",
+              sender: { id: "ou_b" },
+              body: { content: JSON.stringify({ text: "中间讨论" }) },
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({ code: 0, data: { has_more: false, items: [] } });
+
+    const client = new ChannelClient({
+      appId: "app",
+      appSecret: "secret",
+      allowedChatIds: new Set(),
+      deliveryStatePath: "/tmp/fcb-channel-test-delivery.json",
+    });
+    (client as unknown as { channel: unknown }).channel = {
+      rawClient: { im: { v1: { message: { get, list } } } },
+    };
+    const current: LarkMessageEvent = {
+      message_id: "om_3",
+      chat_id: "oc_1",
+      chat_type: "group",
+      thread_id: "omt_real",
+      root_id: "om_root",
+      sender_id: "ou_c",
+      content: JSON.stringify({ text: "@_user_1 请总结" }),
+      create_time: "3000",
+    };
+
+    const context = await client.getThreadContext("omt_event", "om_root", current);
+
+    expect(context.map((message) => message.messageId)).toEqual(["om_root", "om_2", "om_3"]);
+    expect(context.map((message) => message.text)).toEqual(["根消息", "中间讨论", "请总结"]);
+    expect(list).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        params: expect.objectContaining({
+          container_id_type: "thread",
+          container_id: "omt_real",
+          page_token: undefined,
+          card_msg_content_type: "raw_card_content",
+        }),
+      }),
+    );
+    expect(list).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ params: expect.objectContaining({ page_token: "next" }) }),
+    );
   });
 });

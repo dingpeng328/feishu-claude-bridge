@@ -143,6 +143,12 @@ export class BridgeHandler {
     // Top-level @ (no root_id) → reply_in_thread to open a Feishu topic.
     const isTopLevel = !(typeof event.root_id === "string" && event.root_id);
 
+    // A group-topic @ must be answered against a fresh snapshot of the whole
+    // topic, including non-mention discussion that the event stream intentionally
+    // filters out. Direct messages and top-level group messages keep the existing
+    // single-message path.
+    const isGroupTopic = event.chat_type !== "p2p" && Boolean(event.thread_id || event.root_id);
+
     let card: CardHandle | undefined;
     try {
       card = await this.deps.cardRenderer.start(messageId, { replyInThread: isTopLevel });
@@ -152,6 +158,16 @@ export class BridgeHandler {
     }
 
     try {
+      const threadContext = isGroupTopic
+        ? (
+            await this.deps.client.getThreadContext(
+              event.thread_id ?? event.root_id ?? messageId,
+              event.root_id ?? messageId,
+              event,
+            )
+          ).filter((message) => message.messageId !== card?.messageId)
+        : undefined;
+
       // Shared cwd for all topics (e.g. a real repo). Topics stay isolated by
       // their own agent session (--resume/resume by threadId), not by separate dirs.
       const cwd = this.deps.workDir;
@@ -168,7 +184,7 @@ export class BridgeHandler {
           return;
         }
         const isNewThread = currentExisting === undefined;
-        const prompt = renderPrompt({ parsed, isNewThread, workDir: cwd });
+        const prompt = renderPrompt({ parsed, isNewThread, workDir: cwd, threadContext });
 
         const handle = runAgent({
           agentKind: this.deps.agentKind,

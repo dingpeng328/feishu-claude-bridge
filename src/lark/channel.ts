@@ -13,6 +13,7 @@
 import { createLarkChannel } from "@larksuiteoapi/node-sdk";
 import type { LarkMessageEvent } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
+import { extractMessageText } from "./message.js";
 import type { OutboundCardClient } from "./card.js";
 import { DeliveryState } from "./deliveryState.js";
 
@@ -49,7 +50,7 @@ interface ApiMessageItem {
   create_time?: string;
   deleted?: boolean;
   chat_id?: string;
-  sender?: { id?: string; id_type?: string; sender_type?: string };
+  sender?: { id?: string; id_type?: string; sender_type?: string; sender_name?: string };
   body?: { content?: string };
   mentions?: Array<{ key?: string; id?: string; id_type?: string; name?: string }>;
 }
@@ -79,6 +80,11 @@ interface LarkChannel {
             path: { message_id: string };
             data: { content: string; msg_type: string; reply_in_thread?: boolean };
           }): Promise<RawReplyResult>;
+          get(payload: { path: { message_id: string } }): Promise<{
+            code?: number;
+            msg?: string;
+            data?: { items?: ApiMessageItem[] };
+          }>;
           list(payload: {
             params: {
               container_id_type: string;
@@ -88,6 +94,8 @@ interface LarkChannel {
               sort_type?: "ByCreateTimeAsc" | "ByCreateTimeDesc";
               page_size?: number;
               page_token?: string;
+              with_sender_name?: boolean;
+              card_msg_content_type?: "raw_card_content";
             };
           }): Promise<{
             code?: number;
@@ -105,6 +113,7 @@ interface LarkChannel {
 // hang up" / no response), which would wedge handleOne and leak a concurrency
 // slot. Bound every outbound call so the caller always settles.
 const OUTBOUND_TIMEOUT_MS = 15_000;
+const THREAD_HISTORY_TIMEOUT_MS = 15_000;
 
 /** Reject if `p` hasn't settled within `ms`. The underlying call is left to settle on its own. */
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -196,6 +205,45 @@ export function apiMessageToLarkEvent(
     content: item.body?.content ?? JSON.stringify({ text: "" }),
     create_time: item.create_time ?? String(Date.now()),
     recovered_from_history: true,
+  };
+}
+
+/** A compact, prompt-safe representation of one message in a Feishu topic. */
+export interface ThreadContextMessage {
+  messageId: string;
+  senderId: string;
+  senderName?: string;
+  createTime: string;
+  msgType: string;
+  text: string;
+}
+
+function historyMessageText(item: ApiMessageItem): string {
+  const content = item.body?.content ?? "";
+  const readable = extractMessageText(content);
+  if (readable) return readable;
+
+  let detail = "";
+  try {
+    const body = JSON.parse(content) as Record<string, unknown>;
+    const name = body["file_name"] ?? body["title"];
+    if (typeof name === "string" && name.trim()) detail = `: ${name.trim()}`;
+  } catch {
+    // The type marker below is still useful for non-JSON/unsupported content.
+  }
+  return `[${item.msg_type ?? "未知类型"}消息${detail}]`;
+}
+
+function apiMessageToThreadContext(item: ApiMessageItem): ThreadContextMessage | null {
+  const messageId = item.message_id;
+  if (item.deleted || !messageId) return null;
+  return {
+    messageId,
+    senderId: item.sender?.id ?? "system",
+    senderName: item.sender?.sender_name,
+    createTime: item.create_time ?? "",
+    msgType: item.msg_type ?? "unknown",
+    text: historyMessageText(item),
   };
 }
 
@@ -397,6 +445,95 @@ export class ChannelClient {
       if (r.done) return;
       yield r.value;
     }
+  }
+
+  /**
+   * Fetch the complete topic snapshot used to answer an in-thread @mention.
+   * Feishu's `thread` container contains replies only, so the root message is
+   * fetched separately and merged. Pagination continues until `has_more=false`.
+   */
+  async getThreadContext(
+    threadId: string,
+    rootMessageId?: string,
+    fallbackEvent?: LarkMessageEvent,
+  ): Promise<ThreadContextMessage[]> {
+    const channel = this.channel;
+    if (!channel) throw new Error("[channel] thread history requested before connect()");
+
+    const rawItems: ApiMessageItem[] = [];
+    let resolvedThreadId = threadId;
+    if (rootMessageId) {
+      const root = await withTimeout(
+        channel.rawClient.im.v1.message.get({ path: { message_id: rootMessageId } }),
+        THREAD_HISTORY_TIMEOUT_MS,
+        `get topic root ${rootMessageId}`,
+      );
+      if (root.code && root.code !== 0) {
+        throw new Error(`${root.code}: ${root.msg ?? "message.get failed"}`);
+      }
+      const rootItems = root.data?.items ?? [];
+      rawItems.push(...rootItems);
+      resolvedThreadId = rootItems.find((item) => item.thread_id)?.thread_id ?? resolvedThreadId;
+    }
+
+    let pageToken: string | undefined;
+    const seenPageTokens = new Set<string>();
+    while (true) {
+      const res = await withTimeout(
+        channel.rawClient.im.v1.message.list({
+          params: {
+            container_id_type: "thread",
+            container_id: resolvedThreadId,
+            sort_type: "ByCreateTimeAsc",
+            page_size: 50,
+            page_token: pageToken,
+            with_sender_name: true,
+            card_msg_content_type: "raw_card_content",
+          },
+        }),
+        THREAD_HISTORY_TIMEOUT_MS,
+        `list topic ${resolvedThreadId}`,
+      );
+      if (res.code && res.code !== 0) {
+        throw new Error(`${res.code}: ${res.msg ?? "thread message.list failed"}`);
+      }
+      rawItems.push(...(res.data?.items ?? []));
+
+      const nextToken = res.data?.page_token;
+      if (!res.data?.has_more || !nextToken) break;
+      if (seenPageTokens.has(nextToken)) {
+        throw new Error(`[channel] repeated page_token while listing topic ${resolvedThreadId}`);
+      }
+      seenPageTokens.add(nextToken);
+      pageToken = nextToken;
+    }
+
+    const byMessageId = new Map<string, ThreadContextMessage>();
+    for (const item of rawItems) {
+      const context = apiMessageToThreadContext(item);
+      if (context && !byMessageId.has(context.messageId)) {
+        byMessageId.set(context.messageId, context);
+      }
+    }
+    // The receive event can become visible slightly before the history endpoint.
+    // Never let that read-after-write race omit the very @mention being answered.
+    if (fallbackEvent && !byMessageId.has(fallbackEvent.message_id)) {
+      byMessageId.set(fallbackEvent.message_id, {
+        messageId: fallbackEvent.message_id,
+        senderId: fallbackEvent.sender_id,
+        createTime: fallbackEvent.create_time,
+        msgType:
+          typeof fallbackEvent["message_type"] === "string"
+            ? fallbackEvent["message_type"]
+            : typeof fallbackEvent["msg_type"] === "string"
+              ? fallbackEvent["msg_type"]
+              : "text",
+        text: extractMessageText(fallbackEvent.content),
+      });
+    }
+    return [...byMessageId.values()].sort(
+      (a, b) => eventTimestampMs(a.createTime) - eventTimestampMs(b.createTime),
+    );
   }
 
   /** Idempotently open the WS (+ arm the silent-deaf watchdog). */

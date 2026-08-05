@@ -30,6 +30,13 @@ describe("parseMessage", () => {
     expect(p.text).toContain("帮我写代码");
   });
 
+  it("extracts markdown text from an interactive card body", () => {
+    const content = JSON.stringify({
+      elements: [{ tag: "markdown", content: "已有结论：需要回滚" }],
+    });
+    expect(parseMessage(ev({ content })).text).toContain("已有结论：需要回滚");
+  });
+
   it("top-level @ (no root_id): threadId = message_id", () => {
     const p = parseMessage(ev({ message_id: "om_top" }));
     expect(p.threadId).toBe("om_top");

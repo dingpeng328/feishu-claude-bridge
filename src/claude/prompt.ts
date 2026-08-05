@@ -8,16 +8,19 @@
  */
 
 import type { ParsedMessage } from "../lark/message.js";
+import type { ThreadContextMessage } from "../lark/channel.js";
 
 export interface RenderPromptInput {
   parsed: ParsedMessage;
   isNewThread: boolean;
   /** Absolute cwd the agent subprocess runs in. */
   workDir: string;
+  /** Complete Feishu topic snapshot, present for an @mention inside a group topic. */
+  threadContext?: ThreadContextMessage[];
 }
 
 export function renderPrompt(input: RenderPromptInput): string {
-  const { parsed, isNewThread, workDir } = input;
+  const { parsed, isNewThread, workDir, threadContext } = input;
 
   const lines: string[] = [];
 
@@ -33,9 +36,6 @@ export function renderPrompt(input: RenderPromptInput): string {
       `sender:        ${parsed.senderOpenId}`,
       `is_new_thread: true`,
       `工作目录:      ${workDir}(你的 cwd,可读写文件、跑命令;若它是个项目仓库,本地 agent 会按自身规则加载项目指令和技能)`,
-      "",
-      "如需查看本话题的完整历史(用户可能把背景放在首楼),可执行:",
-      `  lark-cli api GET /open-apis/im/v1/messages/${parsed.threadId} --as bot`,
       "</thread-context>",
     );
   } else {
@@ -45,6 +45,25 @@ export function renderPrompt(input: RenderPromptInput): string {
       `message_id:    ${parsed.messageId}`,
       `is_new_thread: false(续接同一话题,你的上下文已通过 --resume 恢复)`,
       "</thread-context>",
+    );
+  }
+
+  if (threadContext !== undefined) {
+    lines.push(
+      "",
+      "<thread-history>",
+      "这是收到本次 @ 时从飞书拉取的完整话题快照，已按时间升序排列。请综合全部讨论，重点回答当前消息。",
+      ...threadContext.map((message) =>
+        JSON.stringify({
+          message_id: message.messageId,
+          sender: message.senderName ?? message.senderId,
+          sender_id: message.senderId,
+          create_time: message.createTime,
+          msg_type: message.msgType,
+          text: message.text,
+        }),
+      ),
+      "</thread-history>",
     );
   }
 

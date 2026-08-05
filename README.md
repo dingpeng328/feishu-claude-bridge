@@ -13,15 +13,16 @@
    1. parseMessage           解析出 threadId / 文本 / sender
    2. sessionStore.get       查这个话题之前的 agent session
    3. card.start             飞书回一张「⏳ 处理中」卡片(顶楼 @ 用 reply_in_thread 开话题)
-   4. renderPrompt           极简 prompt(线程上下文 + 用户消息)
-   5. runAgent               spawn `claude` 或 `codex exec --json`(带 session 续接)
-   6. 流式事件               card.handle 节流刷新卡片(实时显示文本 / 工具调用)
-   7. card.finalize          用累计的回复文本定稿,exitCode 0 即 ✅
-   8. sessionStore.put       存 sessionId,下一轮续接同一对话
+   4. getThreadContext       话题内 @ 时分页拉取首楼 + 全部回复
+   5. renderPrompt           完整话题快照 + 当前用户消息
+   6. runAgent               spawn `claude` 或 `codex exec --json`(带 session 续接)
+   7. 流式事件               card.handle 节流刷新卡片(实时显示文本 / 工具调用)
+   8. card.finalize          用累计的回复文本定稿,exitCode 0 即 ✅
+   9. sessionStore.put       存 sessionId,下一轮续接同一对话
 ```
 
-- **话题续接**：顶楼 @bot 开一个话题；话题内再次 @bot 的回复(有 `root_id`)归到同一 `threadId` → 命中同一 agent session → Claude 用 `--resume`，Codex 用 `codex exec resume`，上下文连续。话题内未 @bot 的消息会被忽略。
-- **群消息触发**：群聊和群话题中的每一条消息都必须直接 @bot 才会处理；未 @ 的普通讨论一律忽略。使用 `@bot 已解决`、`@bot done` 等结束词可以清理该话题的 agent session。
+- **话题续接**：顶楼 @bot 开一个话题；话题内再次 @bot 的回复(有 `root_id`)归到同一 `threadId` → 命中同一 agent session → Claude 用 `--resume`，Codex 用 `codex exec resume`。每次话题内 @bot 时，还会重新分页拉取首楼和全部话题回复，因此期间未 @bot 的普通讨论也会进入本轮上下文。
+- **群消息触发**：群聊和群话题中的每一条消息都必须直接 @bot 才会触发处理；未 @ 的普通讨论不会单独触发，但会在下一次话题内 @bot 时被一并读取。使用 `@bot 已解决`、`@bot done` 等结束词可以清理该话题的 agent session。
 - **本机登录态**：复用你本机 CLI 的登录。Claude 模式下 bridge 会主动剥掉 `ANTHROPIC_API_KEY`，避免切到 API 计费。
 - **共享 cwd**：默认 `~/.feishu-claude-bridge/work`；也可以设成某个项目仓库，让 agent 读写代码、执行命令。
 
@@ -40,6 +41,7 @@
 4. **权限管理**开通 scope：
    - `im:message`(读取与发送单聊/群消息)
    - `im:message:send_as_bot`(以应用身份发消息)
+   - `im:message.group_msg`(读取群内完整话题历史)
    - 接收消息相关 scope(`im:message.group_at_msg`、`im:message.p2p_msg` 等按需)
 5. 发布版本并通过审核(企业内部应用一般自助通过)。
 6. 在「凭证与基础信息」拿到 **App ID / App Secret**。
@@ -79,7 +81,7 @@ macOS 的节能 / **App Nap** 会把空闲或后台的 node 进程挂起 → 飞
 这是飞书长连接服务的部署前提,笔记本本质上不适合长驻。Linux 无此节能问题,`bin/start.sh`
 会自动跳过 caffeinate 直接运行。
 
-跑起来后，在群里 **@机器人** 发一句话 → 它会开一个**话题**并刷新出回复卡片。后续在该话题里每次都需要再次 **@机器人**，bridge 才会把新消息交给同一个本地 Codex session；未 @ 的普通讨论不会触发。发送 `@机器人 已解决` / `@机器人 done` 等结束词可清理该话题会话。
+跑起来后，在群里 **@机器人** 发一句话 → 它会开一个**话题**并刷新出回复卡片。后续在该话题里每次都需要再次 **@机器人** 才会触发；触发后 bridge 会拉取首楼和全部回复（包括期间未 @ 的普通讨论），再交给同一个本地 Codex session 综合回答。发送 `@机器人 已解决` / `@机器人 done` 等结束词可清理该话题会话。
 
 bridge 有三层丢消息保护：每 30 秒发送一次飞书应用层 ping，15 秒收不到 pong 就强制断开并自动重连；每 20 分钟主动刷新一次长连接；每 60 秒通过历史消息接口补拉遗漏的直接 @，并在 `~/.feishu-claude-bridge/delivery-state.json` 中持久化游标、按 `message_id` 去重。运行日志同时写入 `~/.feishu-claude-bridge/bridge.log`，不再只存在于启动终端。
 
