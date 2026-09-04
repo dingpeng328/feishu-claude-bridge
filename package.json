@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "file:vendor/larksuiteoapi-node-sdk",
+    "@larksuite/channel": "0.6.1",
     "dotenv": "^16.4.0",
     "zod": "^3.22.0"
   },

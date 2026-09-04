@@ -10,24 +10,36 @@
 import type { ParsedMessage } from "../lark/message.js";
 import type { ThreadContextMessage } from "../lark/channel.js";
 
+export const DEFAULT_AGENT_SYSTEM_PROMPT = [
+  "你是一个通过飞书话题和用户对话的助手,运行在用户本机的 Agent CLI 里。",
+  "请自然、简洁地用中文回复;需要时可以在工作目录里读写文件、执行命令。",
+].join("\n");
+
 export interface RenderPromptInput {
   parsed: ParsedMessage;
   isNewThread: boolean;
   /** Absolute cwd the agent subprocess runs in. */
   workDir: string;
+  /** Configurable role/behavior instructions. Applied when a new agent session starts. */
+  systemPrompt?: string;
   /** Complete Feishu topic snapshot, present for an @mention inside a group topic. */
   threadContext?: ThreadContextMessage[];
 }
 
 export function renderPrompt(input: RenderPromptInput): string {
-  const { parsed, isNewThread, workDir, threadContext } = input;
+  const {
+    parsed,
+    isNewThread,
+    workDir,
+    systemPrompt = DEFAULT_AGENT_SYSTEM_PROMPT,
+    threadContext,
+  } = input;
 
   const lines: string[] = [];
 
   if (isNewThread) {
     lines.push(
-      "你是一个通过飞书话题和用户对话的助手,运行在用户本机的 Agent CLI 里。",
-      "请自然、简洁地用中文回复;需要时可以在工作目录里读写文件、执行命令。",
+      systemPrompt.trim(),
       "",
       "<thread-context>",
       `thread_id:     ${parsed.threadId}`,

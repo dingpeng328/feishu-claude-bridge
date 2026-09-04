@@ -14,7 +14,7 @@
 
 import fs from "node:fs/promises";
 import type { LarkMessageEvent } from "../lark/transport.js";
-import type { ChannelClient } from "../lark/channel.js";
+import type { ChannelClient, ThreadContextMessage } from "../lark/channel.js";
 import type { CardRenderer, CardHandle } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import { parseMessage, sessionKeyOf } from "../lark/message.js";
@@ -31,6 +31,8 @@ export interface BridgeHandlerDeps {
   workDir: string;
   agentKind: AgentKind;
   agentBin: string;
+  /** Role/behavior instructions for newly-created agent sessions. */
+  agentSystemPrompt: string;
   subprocessTimeoutMs: number;
 }
 
@@ -149,25 +151,44 @@ export class BridgeHandler {
     // single-message path.
     const isGroupTopic = event.chat_type !== "p2p" && Boolean(event.thread_id || event.root_id);
 
-    let card: CardHandle | undefined;
-    try {
-      card = await this.deps.cardRenderer.start(messageId, { replyInThread: isTopLevel });
-    } catch (err) {
-      console.error("[handler] failed to start card for thread", threadId, err);
-      // Continue without a card — session bookkeeping still matters.
+    // Feishu topic history is the cross-machine source of truth. A replayed
+    // mention may be new to this machine's delivery-state.json even though the
+    // same bot already answered it elsewhere. Check before creating our own
+    // thinking card, otherwise that card would look like the prior answer.
+    let threadContext: ThreadContextMessage[] | undefined;
+    if (isGroupTopic) {
+      try {
+        threadContext = await this.deps.client.getThreadContext(
+          event.thread_id ?? event.root_id ?? messageId,
+          event.root_id ?? messageId,
+          event,
+        );
+      } catch (err) {
+        console.error("[handler] failed to inspect topic history for thread", threadId, err);
+        const failureCard = await this.startCard(event.chat_id, messageId, isTopLevel, threadId);
+        if (failureCard) {
+          await failureCard.finalize({ success: false, failureReason: String(err) });
+        }
+        return;
+      }
+
+      const handledReply = findBotReplyAfterEvent(
+        threadContext,
+        event,
+        this.deps.client.getBotSenderIds(),
+      );
+      if (handledReply) {
+        console.log(
+          `[handler] skipped message_id=${messageId} thread=${threadId} ` +
+            `reason=topic-already-handled reply_message_id=${handledReply.messageId}`,
+        );
+        return;
+      }
     }
 
-    try {
-      const threadContext = isGroupTopic
-        ? (
-            await this.deps.client.getThreadContext(
-              event.thread_id ?? event.root_id ?? messageId,
-              event.root_id ?? messageId,
-              event,
-            )
-          ).filter((message) => message.messageId !== card?.messageId)
-        : undefined;
+    const card = await this.startCard(event.chat_id, messageId, isTopLevel, threadId);
 
+    try {
       // Shared cwd for all topics (e.g. a real repo). Topics stay isolated by
       // their own agent session (--resume/resume by threadId), not by separate dirs.
       const cwd = this.deps.workDir;
@@ -184,7 +205,13 @@ export class BridgeHandler {
           return;
         }
         const isNewThread = currentExisting === undefined;
-        const prompt = renderPrompt({ parsed, isNewThread, workDir: cwd, threadContext });
+        const prompt = renderPrompt({
+          parsed,
+          isNewThread,
+          workDir: cwd,
+          systemPrompt: this.deps.agentSystemPrompt,
+          threadContext,
+        });
 
         const handle = runAgent({
           agentKind: this.deps.agentKind,
@@ -297,6 +324,58 @@ export class BridgeHandler {
       }
     }
   }
+
+  private async startCard(
+    chatId: string,
+    messageId: string,
+    replyInThread: boolean,
+    threadId: string,
+  ): Promise<CardHandle | undefined> {
+    try {
+      return await this.deps.cardRenderer.start(chatId, messageId, { replyInThread });
+    } catch (err) {
+      console.error("[handler] failed to start card for thread", threadId, err);
+      // Continue without a card — session bookkeeping still matters.
+      return undefined;
+    }
+  }
+}
+
+function eventTimestampMs(value: string): number {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 1_000_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function findBotReplyAfterEvent(
+  context: ThreadContextMessage[],
+  event: LarkMessageEvent,
+  botSenderIds: string[],
+): ThreadContextMessage | undefined {
+  if (botSenderIds.length === 0) return undefined;
+  const senderIds = new Set(botSenderIds);
+
+  const currentIndex = context.findIndex((message) => message.messageId === event.message_id);
+  if (currentIndex >= 0) {
+    return context.slice(currentIndex + 1).find((message) => isCompletedBotReply(message, senderIds));
+  }
+
+  const eventTime = eventTimestampMs(event.create_time);
+  return context.find(
+    (message) =>
+      isCompletedBotReply(message, senderIds) && eventTimestampMs(message.createTime) > eventTime,
+  );
+}
+
+function isCompletedBotReply(message: ThreadContextMessage, botSenderIds: Set<string>): boolean {
+  if (!botSenderIds.has(message.senderId)) return false;
+  // Bridge replies are interactive cards. Only a completed native stream (or a
+  // legacy green card) proves another instance finished; in-progress,
+  // interrupted, and failed cards remain retryable.
+  return message.msgType !== "interactive" || message.cardStatus === "success";
 }
 
 function eventText(event: LarkMessageEvent): string {

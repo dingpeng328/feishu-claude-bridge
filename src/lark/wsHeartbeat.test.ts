@@ -1,87 +1,51 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LoggerLevel, WSClient } from "@larksuiteoapi/node-sdk";
+import { describe, expect, it, vi } from "vitest";
+import { buildChannelSdkOptions } from "./channel.js";
 
-interface TestWsClient {
-  wsConfig: {
-    updateWs(value: Record<string, unknown>): void;
-    setWSInstance(value: unknown): void;
-  };
-  pingLoop(): void;
-  handleControlData(data: unknown): Promise<void>;
-  sendMessage: ReturnType<typeof vi.fn>;
-  pongTimeout?: ReturnType<typeof setTimeout>;
-  lastPongAt: number;
-  close(params?: { force?: boolean }): void;
-}
+describe("official Channel SDK connection config", () => {
+  it("enables bounded handshakes, REST calls, and app-level keepalive", () => {
+    const onUnrecoverable = vi.fn();
+    const options = buildChannelSdkOptions(
+      {
+        appId: "cli_test",
+        appSecret: "secret",
+        allowedChatIds: new Set(["oc_allowed"]),
+      },
+      onUnrecoverable,
+    );
 
-function makeClient() {
-  const client = new WSClient({
-    appId: "test-app",
-    appSecret: "test-secret",
-    loggerLevel: LoggerLevel.error,
-  }) as unknown as TestWsClient;
-  const ws = {
-    readyState: 1, // ws.OPEN
-    terminate: vi.fn(function (this: { readyState: number }) {
-      this.readyState = 3;
-    }),
-    removeAllListeners: vi.fn(),
-    close: vi.fn(),
-  };
-  client.wsConfig.updateWs({ serviceId: "1", pingInterval: 120_000 });
-  client.wsConfig.setWSInstance(ws);
-  client.sendMessage = vi.fn();
-  return { client, ws };
-}
-
-describe("vendored Feishu WS heartbeat", () => {
-  beforeEach(() => vi.useFakeTimers());
-  afterEach(() => vi.useRealTimers());
-
-  it("sends an application ping every 30 seconds", () => {
-    const { client } = makeClient();
-    client.pingLoop();
-    expect(client.sendMessage).toHaveBeenCalledTimes(1);
-
-    // Pretend the first pong arrived so its timeout does not terminate the fake socket.
-    clearTimeout(client.pongTimeout);
-    client.pongTimeout = undefined;
-    vi.advanceTimersByTime(29_999);
-    expect(client.sendMessage).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(1);
-    expect(client.sendMessage).toHaveBeenCalledTimes(2);
-    client.close({ force: true });
+    expect(options).toMatchObject({
+      appId: "cli_test",
+      source: "feishu-claude-bridge",
+      includeRawEvent: true,
+      policy: {
+        requireMention: true,
+        groupAllowlist: ["oc_allowed"],
+      },
+      wsConfig: { pingTimeout: 15 },
+      handshakeTimeoutMs: 15_000,
+      connectTimeoutMs: 15_000,
+      httpTimeoutMs: 15_000,
+      keepalive: {
+        enabled: true,
+        intervalMs: 15_000,
+        onUnrecoverable,
+      },
+    });
   });
 
-  it("terminates an OPEN socket when pong is absent for 15 seconds", () => {
-    const { client, ws } = makeClient();
-    client.pingLoop();
-    vi.advanceTimersByTime(14_999);
-    expect(ws.terminate).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(1);
-    expect(ws.terminate).toHaveBeenCalledOnce();
-    client.close({ force: true });
-  });
-
-  it("clears the timeout when pong arrives", async () => {
-    const { client, ws } = makeClient();
-    client.pingLoop();
-    const before = client.lastPongAt;
-
-    await client.handleControlData({
-      headers: [{ key: "type", value: "pong" }],
-      payload: new TextEncoder().encode(JSON.stringify({
-        PingInterval: 120,
-        ReconnectCount: -1,
-        ReconnectInterval: 120,
-        ReconnectNonce: 30,
-      })),
+  it("uses native stream throttling and the SDK's 30k rollover boundary", () => {
+    const options = buildChannelSdkOptions({
+      appId: "cli_test",
+      appSecret: "secret",
+      allowedChatIds: new Set(),
     });
 
-    expect(client.lastPongAt).toBeGreaterThanOrEqual(before);
-    expect(client.pongTimeout).toBeUndefined();
-    vi.advanceTimersByTime(15_000);
-    expect(ws.terminate).not.toHaveBeenCalled();
-    client.close({ force: true });
+    expect(options.outbound).toEqual({
+      streamThrottleMs: 100,
+      streamThrottleChars: 50,
+      streamInitialText: "> ⏳ **正在处理**\n> Agent 正在思考或执行任务...",
+      streamMaxElementChars: 30_000,
+      retry: { maxAttempts: 3, baseDelayMs: 500 },
+    });
   });
 });

@@ -50,6 +50,7 @@ function makeDeps(events: LarkMessageEvent[]) {
     })),
   };
   const client = {
+    getBotSenderIds: vi.fn(() => ["cli_bot", "ou_bot"]),
     getThreadContext: vi.fn(async (): Promise<ThreadContextMessage[]> => []),
     async *events(): AsyncIterable<LarkMessageEvent> {
       for (const e of events) yield e;
@@ -96,6 +97,7 @@ function makeHandler(deps: ReturnType<typeof makeDeps>) {
     workDir,
     agentKind: "claude",
     agentBin: "claude",
+    agentSystemPrompt: "测试助手提示词",
     subprocessTimeoutMs: 1000,
   });
 }
@@ -135,7 +137,9 @@ describe("BridgeHandler.handleOne", () => {
     await makeHandler(deps).run();
     await waitFor(() => deps.card.finalizeArgs !== undefined);
 
-    expect(deps.cardRenderer.start).toHaveBeenCalledWith("om_top", { replyInThread: true });
+    expect(deps.cardRenderer.start).toHaveBeenCalledWith("oc_1", "om_top", {
+      replyInThread: true,
+    });
     expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "答案是 4" });
     expect(store.get("om_top")?.sessionId).toBe("sess_new");
   });
@@ -168,13 +172,6 @@ describe("BridgeHandler.handleOne", () => {
         msgType: "text",
         text: "请综合一下",
       },
-      {
-        messageId: "om_card",
-        senderId: "ou_bot",
-        createTime: "4",
-        msgType: "interactive",
-        text: "[interactive消息]",
-      },
     ]);
 
     await makeHandler(deps).run();
@@ -185,8 +182,113 @@ describe("BridgeHandler.handleOne", () => {
     expect(prompt).toContain("背景：发布失败");
     expect(prompt).toContain("普通讨论，没有 @ 机器人");
     expect(prompt).toContain("请综合全部讨论，重点回答当前消息");
-    expect(prompt).not.toContain("[interactive消息]");
     expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "综合回复" });
+  });
+
+  it("skips a replay when this bot already replied after the same topic message", async () => {
+    runAgentMock.mockReturnValue(
+      fakeRun([{ type: "text_delta", text: "不应重复执行", raw: {} }]),
+    );
+    const current = {
+      ...inThreadReply("om_replayed", "om_root", "请处理", true),
+      recovered_from_history: true,
+      create_time: "2000",
+    };
+    const deps = makeDeps([current]);
+    deps.client.getThreadContext.mockResolvedValue([
+      {
+        messageId: "om_replayed",
+        senderId: "ou_user",
+        createTime: "2000",
+        msgType: "text",
+        text: "请处理",
+      },
+      {
+        messageId: "om_answered_elsewhere",
+        senderId: "cli_bot",
+        createTime: "3000",
+        msgType: "interactive",
+        cardStatus: "success",
+        text: "已经处理完成",
+      },
+    ]);
+
+    await makeHandler(deps).run();
+    await waitFor(() => deps.client.getThreadContext.mock.calls.length === 1);
+
+    expect(deps.client.getThreadContext).toHaveBeenCalledOnce();
+    expect(deps.cardRenderer.start).not.toHaveBeenCalled();
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an unfinished bot card as already handled", async () => {
+    runAgentMock.mockReturnValue(
+      fakeRun([{ type: "text_delta", text: "重新处理完成", raw: {} }]),
+    );
+    const current = {
+      ...inThreadReply("om_replayed", "om_root", "请处理", true),
+      recovered_from_history: true,
+      create_time: "2000",
+    };
+    const deps = makeDeps([current]);
+    deps.client.getThreadContext.mockResolvedValue([
+      {
+        messageId: "om_replayed",
+        senderId: "ou_user",
+        createTime: "2000",
+        msgType: "text",
+        text: "请处理",
+      },
+      {
+        messageId: "om_stuck_card",
+        senderId: "cli_bot",
+        createTime: "3000",
+        msgType: "interactive",
+        cardStatus: "thinking",
+        text: "思考中",
+      },
+    ]);
+
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+
+    expect(deps.cardRenderer.start).toHaveBeenCalledOnce();
+    expect(runAgentMock).toHaveBeenCalledOnce();
+    expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "重新处理完成" });
+  });
+
+  it("handles a newer mention when this bot only replied earlier in the topic", async () => {
+    runAgentMock.mockReturnValue(
+      fakeRun([{ type: "text_delta", text: "处理新问题", raw: {} }]),
+    );
+    const current = {
+      ...inThreadReply("om_new", "om_root", "再看下这个新问题", true),
+      create_time: "3000",
+    };
+    const deps = makeDeps([current]);
+    deps.client.getThreadContext.mockResolvedValue([
+      {
+        messageId: "om_old_answer",
+        senderId: "ou_bot",
+        createTime: "2000",
+        msgType: "interactive",
+        text: "旧问题已处理",
+      },
+      {
+        messageId: "om_new",
+        senderId: "ou_user",
+        createTime: "3000",
+        msgType: "text",
+        text: "再看下这个新问题",
+      },
+    ]);
+
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+
+    expect(deps.cardRenderer.start).toHaveBeenCalledOnce();
+    expect(runAgentMock).toHaveBeenCalledOnce();
+    expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "处理新问题" });
   });
 
   it("retries without resume on stale session, then succeeds", async () => {
@@ -281,6 +383,7 @@ function makeMultiCardDeps(events: LarkMessageEvent[]) {
     }),
   };
   const client = {
+    getBotSenderIds: vi.fn(() => ["cli_bot", "ou_bot"]),
     getThreadContext: vi.fn(async (): Promise<ThreadContextMessage[]> => []),
     async *events(): AsyncIterable<LarkMessageEvent> {
       yield events[0]!;
@@ -350,6 +453,7 @@ describe("BridgeHandler interrupt (same-thread)", () => {
       workDir,
       agentKind: "claude",
       agentBin: "claude",
+      agentSystemPrompt: "测试助手提示词",
       subprocessTimeoutMs: 1000,
     });
 
@@ -378,6 +482,7 @@ describe("BridgeHandler interrupt (same-thread)", () => {
       workDir,
       agentKind: "claude",
       agentBin: "claude",
+      agentSystemPrompt: "测试助手提示词",
       subprocessTimeoutMs: 1000,
     });
 
@@ -400,6 +505,7 @@ describe("BridgeHandler interrupt (same-thread)", () => {
       workDir,
       agentKind: "claude",
       agentBin: "claude",
+      agentSystemPrompt: "测试助手提示词",
       subprocessTimeoutMs: 1000,
     });
 
@@ -423,6 +529,7 @@ describe("BridgeHandler interrupt (same-thread)", () => {
       workDir,
       agentKind: "claude",
       agentBin: "claude",
+      agentSystemPrompt: "测试助手提示词",
       subprocessTimeoutMs: 1000,
     });
 

@@ -28,6 +28,19 @@ describe("renderPrompt", () => {
     expect(out).toContain("ou_sender: 你好");
   });
 
+  it("uses a configured system prompt for a new session", () => {
+    const out = renderPrompt({
+      parsed: parsed(),
+      isNewThread: true,
+      workDir: "/tmp/work",
+      systemPrompt: "你是值班助手。\n回答必须先给结论。",
+    });
+
+    expect(out).toContain("你是值班助手。\n回答必须先给结论。");
+    expect(out).not.toContain("你是一个通过飞书话题和用户对话的助手");
+    expect(out).toContain("<thread-context>");
+  });
+
   it("includes the complete pulled topic snapshot as structured chronological context", () => {
     const out = renderPrompt({
       parsed: parsed({ messageId: "om_2", text: "现在怎么办" }),

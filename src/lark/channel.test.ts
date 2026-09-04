@@ -9,6 +9,8 @@ import {
   resolveCatchUpIntervalMs,
   resolveCatchUpLookbackMs,
   shouldRebuildChannel,
+  _bridgeCardStatus,
+  _historyMessageText,
 } from "./channel.js";
 import type { LarkMessageEvent } from "./transport.js";
 
@@ -169,6 +171,56 @@ describe("channelMsgToLarkEvent", () => {
   });
 });
 
+describe("native streaming card history", () => {
+  const content = (streamingMode: boolean, markdown: string) =>
+    JSON.stringify({
+      card_schema: "2.0",
+      json_card: JSON.stringify({
+        schema: "2.0",
+        config: { property: { streaming_mode: streamingMode } },
+        body: {
+          elements: [
+            {
+              property: {
+                tag: "markdown",
+                element_id: "stream_md",
+                content: markdown,
+              },
+            },
+          ],
+        },
+      }),
+    });
+
+  it("uses CardKit streaming_mode rather than a visible title", () => {
+    expect(_bridgeCardStatus("interactive", content(true, "正在处理..."))).toBe("streaming");
+    expect(_bridgeCardStatus("interactive", content(false, "最终答案"))).toBe("success");
+    expect(_bridgeCardStatus("interactive", content(false, "> **处理失败**"))).toBe("failure");
+    expect(_bridgeCardStatus("interactive", content(false, "> **已被新消息打断**"))).toBe(
+      "interrupted",
+    );
+  });
+
+  it("extracts native card markdown for topic context", () => {
+    expect(
+      _historyMessageText({
+        message_id: "om_card",
+        msg_type: "interactive",
+        body: { content: content(false, "> ✅ **回复完成**\n\n最终答案") },
+      }),
+    ).toBe("最终答案");
+  });
+
+  it("does not classify an unrelated interactive card as a bridge reply", () => {
+    const unrelated = JSON.stringify({
+      schema: "2.0",
+      config: { streaming_mode: false },
+      body: { elements: [{ tag: "markdown", element_id: "other", content: "审批卡片" }] },
+    });
+    expect(_bridgeCardStatus("interactive", unrelated)).toBeUndefined();
+  });
+});
+
 describe("apiMessageToLarkEvent", () => {
   const item = {
     message_id: "om_recovered",
@@ -235,6 +287,24 @@ describe("ChannelClient.getThreadContext", () => {
               sender: { id: "ou_b" },
               body: { content: JSON.stringify({ text: "中间讨论" }) },
             },
+            {
+              message_id: "om_answer",
+              msg_type: "interactive",
+              create_time: "2500",
+              sender: { id: "ou_bot" },
+              body: {
+                content: JSON.stringify({
+                  card_schema: "2.0",
+                  json_card: JSON.stringify({
+                    schema: "2.0",
+                    header: {
+                      property: { title: { property: { content: "✅ 完成" } } },
+                    },
+                    body: { elements: [{ tag: "markdown", content: "处理结果" }] },
+                  }),
+                }),
+              },
+            },
           ],
         },
       })
@@ -262,8 +332,19 @@ describe("ChannelClient.getThreadContext", () => {
 
     const context = await client.getThreadContext("omt_event", "om_root", current);
 
-    expect(context.map((message) => message.messageId)).toEqual(["om_root", "om_2", "om_3"]);
-    expect(context.map((message) => message.text)).toEqual(["根消息", "中间讨论", "请总结"]);
+    expect(context.map((message) => message.messageId)).toEqual([
+      "om_root",
+      "om_2",
+      "om_answer",
+      "om_3",
+    ]);
+    expect(context.map((message) => message.text)).toEqual([
+      "根消息",
+      "中间讨论",
+      "处理结果",
+      "请总结",
+    ]);
+    expect(context.find((message) => message.messageId === "om_answer")?.cardStatus).toBe("success");
     expect(list).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({

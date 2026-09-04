@@ -105,8 +105,6 @@ async function main(): Promise<void> {
   const sessionStore = await SessionStore.load(config.sessionsPath);
   const cardRenderer = new CardRenderer({
     outbound: client.outboundCardClient(),
-    patchIntervalMs: 1000,
-    showToolUseSummary: true,
   });
   const handler = new BridgeHandler({
     client,
@@ -115,6 +113,7 @@ async function main(): Promise<void> {
     workDir: config.workDir,
     agentKind: config.agentKind,
     agentBin: config.agentBin,
+    agentSystemPrompt: config.agentSystemPrompt,
     subprocessTimeoutMs: config.subprocessTimeoutMs,
   });
 

@@ -9,6 +9,7 @@ const ENV_KEYS = [
   "WORK_DIR",
   "AGENT_KIND",
   "AGENT_BIN",
+  "AGENT_SYSTEM_PROMPT",
   "CLAUDE_BIN",
   "SUBPROCESS_TIMEOUT_MS",
 ] as const;
@@ -50,5 +51,18 @@ describe("loadConfig", () => {
 
     expect(config.agentKind).toBe("claude");
     expect(config.agentBin).toBe("codex");
+  });
+
+  it("uses the built-in system prompt by default", () => {
+    setMinimalEnv();
+
+    expect(loadConfig().agentSystemPrompt).toContain("通过飞书话题和用户对话的助手");
+  });
+
+  it("loads a custom multi-line system prompt from the environment", () => {
+    setMinimalEnv();
+    process.env.AGENT_SYSTEM_PROMPT = "你是发布助手。\n先给结论，再给依据。";
+
+    expect(loadConfig().agentSystemPrompt).toBe("你是发布助手。\n先给结论，再给依据。");
   });
 });

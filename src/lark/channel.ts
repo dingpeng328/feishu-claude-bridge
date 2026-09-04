@@ -1,20 +1,19 @@
 /**
  * src/lark/channel.ts
  *
- * Channel-SDK-backed transport — both inbound (events) and outbound (card
- * create/patch) route through ONE live WebSocket handle from the vendored
- * Feishu SDK's `createLarkChannel`.
+ * Channel-SDK-backed transport — both inbound events and outbound native
+ * CardKit streams route through one live WebSocket channel handle.
  *
  * Why the SDK: it reconnects unconditionally on WS close. This wrapper adds a
  * proactive refresh plus an HTTP history catch-up path because a TCP/WS handle
  * can occasionally stay "connected" while Feishu stops delivering events.
  */
 
-import { createLarkChannel } from "@larksuiteoapi/node-sdk";
+import { createLarkChannel } from "@larksuite/channel";
 import type { LarkMessageEvent } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { extractMessageText } from "./message.js";
-import type { OutboundCardClient } from "./card.js";
+import { INITIAL_STREAM_TEXT, type OutboundCardClient } from "./card.js";
 import { DeliveryState } from "./deliveryState.js";
 
 // ---------------------------------------------------------------------------
@@ -33,12 +32,8 @@ interface ChannelNormalizedMessage {
   content?: string;
   mentionedBot?: boolean;
   mentionAll?: boolean;
-  /** Raw im.message.receive_v1 event body (present when includeRawInMessage). */
+  /** Raw im.message.receive_v1 event body (present when includeRawEvent). */
   raw?: unknown;
-}
-
-interface RawReplyResult {
-  data?: { message_id?: string };
 }
 
 interface ApiMessageItem {
@@ -62,7 +57,16 @@ interface LarkChannel {
   on(event: "error", handler: (err: { code?: string; message?: string }) => void): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  updateCard(messageId: string, card: object): Promise<void>;
+  stream(
+    chatId: string,
+    input: {
+      markdown: (controller: {
+        readonly messageId: string;
+        setContent(fullContent: string): Promise<void>;
+      }) => Promise<void>;
+    },
+    opts: { replyTo: string; replyInThread: boolean },
+  ): Promise<{ messageId: string }>;
   rawClient: {
     im: {
       v1: {
@@ -76,10 +80,6 @@ interface LarkChannel {
           }>;
         };
         message: {
-          reply(payload: {
-            path: { message_id: string };
-            data: { content: string; msg_type: string; reply_in_thread?: boolean };
-          }): Promise<RawReplyResult>;
           get(payload: { path: { message_id: string } }): Promise<{
             code?: number;
             msg?: string;
@@ -108,11 +108,6 @@ interface LarkChannel {
   };
 }
 
-// Outbound card calls (reply / updateCard) ride HTTP but share the SDK handle
-// that the WS churn tears down. On a flapping connection they can hang ("socket
-// hang up" / no response), which would wedge handleOne and leak a concurrency
-// slot. Bound every outbound call so the caller always settles.
-const OUTBOUND_TIMEOUT_MS = 15_000;
 const THREAD_HISTORY_TIMEOUT_MS = 15_000;
 
 /** Reject if `p` hasn't settled within `ms`. The underlying call is left to settle on its own. */
@@ -215,11 +210,146 @@ export interface ThreadContextMessage {
   senderName?: string;
   createTime: string;
   msgType: string;
+  /** Bridge card lifecycle, when this is one of our interactive reply cards. */
+  cardStatus?: "thinking" | "streaming" | "success" | "failure" | "interrupted";
   text: string;
+}
+
+function parseInteractiveCard(content: string): Record<string, unknown> | undefined {
+  try {
+    const envelope = JSON.parse(content) as Record<string, unknown>;
+    const rawCard = envelope["json_card"] ?? envelope;
+    const card = typeof rawCard === "string" ? JSON.parse(rawCard) : rawCard;
+    return typeof card === "object" && card !== null
+      ? (card as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function findCardField(value: unknown, key: string): unknown {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findCardField(item, key);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record[key] !== undefined) return record[key];
+  for (const child of Object.values(record)) {
+    const found = findCardField(child, key);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function fieldString(value: Record<string, unknown>, key: string): string | undefined {
+  const found = findCardField(value, key);
+  return typeof found === "string" ? found : undefined;
+}
+
+function cardMarkdownContents(card: Record<string, unknown>): string[] {
+  const contents: string[] = [];
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== "object" || value === null) return;
+    const record = value as Record<string, unknown>;
+    const tag = fieldString(record, "tag");
+    const elementId = fieldString(record, "element_id");
+    if (tag === "markdown" || elementId === "stream_md") {
+      const content = fieldString(record, "content");
+      if (content?.trim()) contents.push(content.trim());
+      return;
+    }
+    Object.values(record).forEach(visit);
+  };
+  visit(card["body"] ?? card);
+  return contents;
+}
+
+function bridgeCardStatus(
+  msgType: string | undefined,
+  content: string,
+): ThreadContextMessage["cardStatus"] {
+  if (msgType !== "interactive") return undefined;
+  const card = parseInteractiveCard(content);
+  if (!card) return undefined;
+
+  const header = card["header"];
+  if (typeof header === "object" && header !== null) {
+    const title = fieldString(header as Record<string, unknown>, "content");
+    if (title?.startsWith("⏳")) return "thinking";
+    if (title?.startsWith("🔧")) return "streaming";
+    if (title?.startsWith("✅")) return "success";
+    if (title?.startsWith("❌")) return "failure";
+    if (title?.startsWith("⏸️")) return "interrupted";
+  }
+
+  const elementId = findCardField(card["body"], "element_id");
+  const streamingMode = findCardField(card["config"], "streaming_mode");
+  if (elementId !== "stream_md" || typeof streamingMode !== "boolean") return undefined;
+  if (streamingMode) return "streaming";
+
+  const markdown = cardMarkdownContents(card).join("\n\n");
+  if (markdown.includes("**处理失败**")) return "failure";
+  if (markdown.includes("**已被新消息打断**")) return "interrupted";
+  return "success";
+}
+
+function interactiveCardText(content: string): string {
+  const card = parseInteractiveCard(content);
+  return card ? cardMarkdownContents(card).join("\n\n") : "";
+}
+
+function stripBridgeStatusBlock(markdown: string): string {
+  const lines = markdown.split("\n");
+  if (!/^> (?:⏳ \*\*正在处理\*\*|✅ \*\*回复完成\*\*|❌ \*\*处理失败\*\*|⏸️ \*\*已被新消息打断\*\*)$/u.test(lines[0] ?? "")) {
+    return markdown;
+  }
+  let bodyStart = 1;
+  while (lines[bodyStart]?.startsWith("> ")) bodyStart++;
+  while (lines[bodyStart] === "") bodyStart++;
+  return lines.slice(bodyStart).join("\n").trim();
+}
+
+function legacyHeaderTitle(card: Record<string, unknown>): string | undefined {
+  const header = card["header"];
+  return typeof header === "object" && header !== null
+    ? fieldString(header as Record<string, unknown>, "content")
+    : undefined;
+}
+
+// Keep the old title-based cards readable during a rolling upgrade. This
+// helper exists separately so history parsing remains explicit and bounded.
+function isLegacyBridgeCard(content: string): boolean {
+  const card = parseInteractiveCard(content);
+  const title = card ? legacyHeaderTitle(card) : undefined;
+  return title !== undefined && /^(⏳|🔧|✅|❌|⏸️)/u.test(title);
 }
 
 function historyMessageText(item: ApiMessageItem): string {
   const content = item.body?.content ?? "";
+  if (item.msg_type === "interactive") {
+    const markdown = interactiveCardText(content);
+    if (markdown) {
+      const body = stripBridgeStatusBlock(markdown);
+      if (body) return body;
+      const status = bridgeCardStatus(item.msg_type, content);
+      if (status === "thinking" || status === "streaming") return "[处理中消息]";
+      if (status === "failure") return "[处理失败消息]";
+      if (status === "interrupted") return "[已打断消息]";
+      if (status === "success") return "[已完成消息]";
+      return markdown;
+    }
+    if (isLegacyBridgeCard(content)) return "[处理中消息]";
+  }
+
   const readable = extractMessageText(content);
   if (readable) return readable;
 
@@ -234,15 +364,22 @@ function historyMessageText(item: ApiMessageItem): string {
   return `[${item.msg_type ?? "未知类型"}消息${detail}]`;
 }
 
+export {
+  bridgeCardStatus as _bridgeCardStatus,
+  historyMessageText as _historyMessageText,
+};
+
 function apiMessageToThreadContext(item: ApiMessageItem): ThreadContextMessage | null {
   const messageId = item.message_id;
   if (item.deleted || !messageId) return null;
+  const content = item.body?.content ?? "";
   return {
     messageId,
     senderId: item.sender?.id ?? "system",
     senderName: item.sender?.sender_name,
     createTime: item.create_time ?? "",
     msgType: item.msg_type ?? "unknown",
+    cardStatus: bridgeCardStatus(item.msg_type, content),
     text: historyMessageText(item),
   };
 }
@@ -317,6 +454,41 @@ const DEFAULT_CATCH_UP_LOOKBACK_MS = 5 * 60_000; // 5 min on the first upgraded 
 const MAX_CATCH_UP_WINDOW_MS = 24 * 60 * 60_000; // bound first recovery after a long outage
 const CATCH_UP_OVERLAP_MS = 60_000; // overlap + message-id dedup avoids timestamp boundary gaps
 const CHAT_DISCOVERY_INTERVAL_MS = 60 * 60_000;
+const SDK_TIMEOUT_MS = 15_000;
+const SDK_KEEPALIVE_INTERVAL_MS = 15_000;
+
+/** Centralize the SDK knobs so reconnect and native-stream behavior stay testable. */
+export function buildChannelSdkOptions(
+  opts: Pick<ChannelClientOptions, "appId" | "appSecret" | "allowedChatIds">,
+  onUnrecoverable: (err: unknown) => void = () => undefined,
+): Parameters<typeof createLarkChannel>[0] {
+  return {
+    appId: opts.appId,
+    appSecret: opts.appSecret,
+    source: "feishu-claude-bridge",
+    policy: {
+      requireMention: true,
+      groupAllowlist: [...opts.allowedChatIds],
+    },
+    includeRawEvent: true,
+    wsConfig: { pingTimeout: 15 },
+    handshakeTimeoutMs: SDK_TIMEOUT_MS,
+    connectTimeoutMs: SDK_TIMEOUT_MS,
+    httpTimeoutMs: SDK_TIMEOUT_MS,
+    keepalive: {
+      enabled: true,
+      intervalMs: SDK_KEEPALIVE_INTERVAL_MS,
+      onUnrecoverable,
+    },
+    outbound: {
+      streamThrottleMs: 100,
+      streamThrottleChars: 50,
+      streamInitialText: INITIAL_STREAM_TEXT,
+      streamMaxElementChars: 30_000,
+      retry: { maxAttempts: 3, baseDelayMs: 500 },
+    },
+  };
+}
 
 export function resolveStaleMs(ctorValue?: number): number {
   let raw: number;
@@ -437,6 +609,12 @@ export class ChannelClient {
     return this.connected;
   }
 
+  /** IDs Feishu may use for this bot in message history (app_id) and live events (open_id). */
+  getBotSenderIds(): string[] {
+    const openId = this.channel?.botIdentity?.openId;
+    return openId ? [this.opts.appId, openId] : [this.opts.appId];
+  }
+
   /** Async iterator over inbound @-mention events. Connects on first call. */
   async *events(): AsyncIterable<LarkMessageEvent> {
     await this.connect();
@@ -545,17 +723,12 @@ export class ChannelClient {
 
   private async connectChannel(): Promise<void> {
     const log = (s: string) => console.log(`[channel] ${s}`);
-    const channel = createLarkChannel({
-      appId: this.opts.appId,
-      appSecret: this.opts.appSecret,
-      // Only deliver group messages that directly @mention this bot. The handler
-      // repeats the same check as a defense-in-depth routing boundary.
-      policy: {
-        requireMention: true,
-        groupAllowlist: [...this.opts.allowedChatIds],
-      },
-      includeRawInMessage: true,
-    } as Parameters<typeof createLarkChannel>[0]) as unknown as LarkChannel;
+    const channel = createLarkChannel(
+      buildChannelSdkOptions(this.opts, (err) => {
+        log(`WS keepalive could not reconnect: ${safeErrorMessage(err)}`);
+        this.requestCatchUp("sdk-keepalive-failed");
+      }),
+    ) as unknown as LarkChannel;
 
     channel.on("message", (msg) => {
       if (this.closed) return;
@@ -637,7 +810,7 @@ export class ChannelClient {
     });
   }
 
-  private requestCatchUp(reason: "connect" | "ws-reconnected" | "poll"): void {
+  private requestCatchUp(reason: "connect" | "ws-reconnected" | "sdk-keepalive-failed" | "poll"): void {
     if (this.closed || !this.deliveryState || this.catchUpDisabledReason) return;
     if (this.catchUpRunning) {
       this.catchUpPending = true;
@@ -660,7 +833,9 @@ export class ChannelClient {
     });
   }
 
-  private async catchUpOnce(reason: "connect" | "ws-reconnected" | "poll"): Promise<void> {
+  private async catchUpOnce(
+    reason: "connect" | "ws-reconnected" | "sdk-keepalive-failed" | "poll",
+  ): Promise<void> {
     const channel = this.channel;
     const state = this.deliveryState;
     const botOpenId = channel?.botIdentity?.openId;
@@ -837,42 +1012,21 @@ export class ChannelClient {
     await this.deliveryState?.close();
   }
 
-  /**
-   * Outbound card transport bound to this same channel handle. card.ts owns all
-   * card-JSON building; this only delivers the leaf network calls.
-   */
+  /** Native CardKit markdown stream bound to the active channel handle. */
   outboundCardClient(): OutboundCardClient {
     const getChannel = (): LarkChannel => {
       if (!this.channel) throw new Error("[channel] outbound called before connect()");
       return this.channel;
     };
     return {
-      async createCard(replyToMessageId, cardJson, opts) {
-        const res = await withTimeout(
-          getChannel().rawClient.im.v1.message.reply({
-            path: { message_id: replyToMessageId },
-            data: {
-              content: cardJson,
-              msg_type: "interactive",
-              reply_in_thread: opts.replyInThread,
-            },
-          }),
-          OUTBOUND_TIMEOUT_MS,
-          "createCard reply",
-        );
-        const messageId = res.data?.message_id;
-        if (!messageId) {
-          throw new Error(`[channel] reply returned no message_id (replyTo=${replyToMessageId})`);
-        }
-        return { messageId };
-      },
-      async patchCard(messageId, cardJson) {
-        // updateCard takes an OBJECT — parse the stringified card (passing a
-        // string would double-encode and Feishu rejects it).
-        await withTimeout(
-          getChannel().updateCard(messageId, JSON.parse(cardJson) as object),
-          OUTBOUND_TIMEOUT_MS,
-          "patchCard updateCard",
+      async streamMarkdown(chatId, replyToMessageId, opts, producer) {
+        return getChannel().stream(
+          chatId,
+          { markdown: producer },
+          {
+            replyTo: replyToMessageId,
+            replyInThread: opts.replyInThread,
+          },
         );
       },
     };

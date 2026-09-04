@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+import { DEFAULT_AGENT_SYSTEM_PROMPT } from "./claude/prompt.js";
 
 // Load .env into process.env (no-op if the file is absent).
 loadDotenv();
@@ -27,6 +28,7 @@ const EnvSchema = z.object({
   WORK_DIR: z.string().optional(),
   AGENT_KIND: z.enum(["claude", "codex"]).optional(),
   AGENT_BIN: z.string().optional(),
+  AGENT_SYSTEM_PROMPT: z.string().optional(),
   CLAUDE_BIN: z.string().optional(),
   SUBPROCESS_TIMEOUT_MS: z.string().optional(),
 });
@@ -50,6 +52,8 @@ export interface Config {
   logPath: string;
   agentKind: "claude" | "codex";
   agentBin: string;
+  /** Role/behavior instructions prepended when a new agent session starts. */
+  agentSystemPrompt: string;
   subprocessTimeoutMs: number;
 }
 
@@ -105,6 +109,10 @@ export function loadConfig(): Config {
     logPath: path.join(HOME_DIR, "bridge.log"),
     agentKind: inferredAgentKind,
     agentBin: configuredAgentBin ?? (inferredAgentKind === "codex" ? "codex" : "claude"),
+    agentSystemPrompt:
+      env.AGENT_SYSTEM_PROMPT === undefined
+        ? DEFAULT_AGENT_SYSTEM_PROMPT
+        : env.AGENT_SYSTEM_PROMPT.trim(),
     subprocessTimeoutMs,
   };
 }
