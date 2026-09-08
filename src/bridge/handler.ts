@@ -95,11 +95,12 @@ export class BridgeHandler {
       }
       const controller = new AbortController();
       inflight.set(key, controller); // becomes the latest turn (overwrites prev)
+      const startedAtMs = Date.now();
 
       const prev = threadQueues.get(key) ?? Promise.resolve();
       const next = prev
         .then(() => acquire())
-        .then(() => this.handleOne(event, controller.signal))
+        .then(() => this.handleOne(event, controller.signal, startedAtMs))
         .catch((err: unknown) => {
           console.error(`[handler] unhandled error on thread ${key}:`, err);
         })
@@ -132,7 +133,11 @@ export class BridgeHandler {
     return "handle";
   }
 
-  private async handleOne(event: LarkMessageEvent, signal?: AbortSignal): Promise<void> {
+  private async handleOne(
+    event: LarkMessageEvent,
+    signal?: AbortSignal,
+    startedAtMs = Date.now(),
+  ): Promise<void> {
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
 
@@ -165,7 +170,13 @@ export class BridgeHandler {
         );
       } catch (err) {
         console.error("[handler] failed to inspect topic history for thread", threadId, err);
-        const failureCard = await this.startCard(event.chat_id, messageId, isTopLevel, threadId);
+        const failureCard = await this.startCard(
+          event.chat_id,
+          messageId,
+          isTopLevel,
+          threadId,
+          startedAtMs,
+        );
         if (failureCard) {
           await failureCard.finalize({ success: false, failureReason: String(err) });
         }
@@ -186,7 +197,13 @@ export class BridgeHandler {
       }
     }
 
-    const card = await this.startCard(event.chat_id, messageId, isTopLevel, threadId);
+    const card = await this.startCard(
+      event.chat_id,
+      messageId,
+      isTopLevel,
+      threadId,
+      startedAtMs,
+    );
 
     try {
       // Shared cwd for all topics (e.g. a real repo). Topics stay isolated by
@@ -330,9 +347,13 @@ export class BridgeHandler {
     messageId: string,
     replyInThread: boolean,
     threadId: string,
+    startedAtMs: number,
   ): Promise<CardHandle | undefined> {
     try {
-      return await this.deps.cardRenderer.start(chatId, messageId, { replyInThread });
+      return await this.deps.cardRenderer.start(chatId, messageId, {
+        replyInThread,
+        startedAtMs,
+      });
     } catch (err) {
       console.error("[handler] failed to start card for thread", threadId, err);
       // Continue without a card — session bookkeeping still matters.

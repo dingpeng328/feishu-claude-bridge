@@ -22,6 +22,8 @@ export interface OutboundCardClient {
 
 export interface CardRendererOptions {
   outbound: OutboundCardClient;
+  /** Injectable clock for deterministic duration rendering in tests. */
+  now?: () => number;
 }
 
 export interface CardHandle {
@@ -91,22 +93,39 @@ function liveMarkdown(bodyText: string, progress?: string): string {
   return progress ? `${PROCESSING_STATUS}\n> ${progress}` : INITIAL_STREAM_TEXT;
 }
 
+function formatDuration(elapsedMs: number): string {
+  const safeMs = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0;
+  if (safeMs < 1000) return "不到 1 秒";
+
+  const totalSeconds = Math.max(1, Math.round(safeMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts: string[] = [];
+  if (hours > 0) parts.push(`${hours} 小时`);
+  if (minutes > 0) parts.push(`${minutes} 分钟`);
+  if (seconds > 0) parts.push(`${seconds} 秒`);
+  return parts.join(" ");
+}
+
 function terminalMarkdown(opts: {
   bodyText: string;
   success: boolean;
   interrupted?: boolean;
+  elapsedMs: number;
 }): string {
   const body = optimizeMarkdownStyle(opts.bodyText);
+  const duration = `> ⏱️ 处理耗时：${formatDuration(opts.elapsedMs)}`;
   if (opts.interrupted) {
-    const status = `> ⏸️ ${INTERRUPTED_MARKER}\n> 正在按新消息继续处理。`;
+    const status = `> ⏸️ ${INTERRUPTED_MARKER}\n${duration}\n> 正在按新消息继续处理。`;
     return body ? `${status}\n\n${body}` : status;
   }
   if (!opts.success) {
-    const status = `> ❌ ${FAILURE_MARKER}\n> 请稍后重试，详细原因已写入服务日志。`;
+    const status = `> ❌ ${FAILURE_MARKER}\n${duration}\n> 请稍后重试，详细原因已写入服务日志。`;
     return body ? `${status}\n\n${body}` : status;
   }
   const answer = body || "本轮没有拿到 agent 的回复，请再 @ 我一次重试。";
-  return `${SUCCESS_STATUS}\n\n${answer}`;
+  return `${SUCCESS_STATUS}\n${duration}\n\n${answer}`;
 }
 
 interface RenderState {
@@ -135,6 +154,8 @@ class CardHandleImpl implements CardHandle {
   private readonly controller: MarkdownStreamController;
   private readonly finishProducer: () => void;
   private readonly streamDone: Promise<{ messageId: string }>;
+  private readonly startedAtMs: number;
+  private readonly now: () => number;
   private finalized = false;
   private finalizePromise: Promise<void> | undefined;
   private updateTail: Promise<void> = Promise.resolve();
@@ -144,11 +165,15 @@ class CardHandleImpl implements CardHandle {
     controller: MarkdownStreamController;
     finishProducer: () => void;
     streamDone: Promise<{ messageId: string }>;
+    startedAtMs: number;
+    now: () => number;
   }) {
     this.messageId = opts.controller.messageId;
     this.controller = opts.controller;
     this.finishProducer = opts.finishProducer;
     this.streamDone = opts.streamDone;
+    this.startedAtMs = opts.startedAtMs;
+    this.now = opts.now;
   }
 
   handle(event: AgentStreamEvent): void {
@@ -209,6 +234,7 @@ class CardHandleImpl implements CardHandle {
       bodyText: opts.finalText ?? this.state.textBuffer,
       success: opts.success,
       interrupted: opts.interrupted,
+      elapsedMs: Math.max(0, this.now() - this.startedAtMs),
     });
 
     let finalUpdateError: unknown;
@@ -229,15 +255,17 @@ class CardHandleImpl implements CardHandle {
 
 export class CardRenderer {
   private readonly outbound: OutboundCardClient;
+  private readonly now: () => number;
 
   constructor(opts: CardRendererOptions) {
     this.outbound = opts.outbound;
+    this.now = opts.now ?? Date.now;
   }
 
   async start(
     chatId: string,
     replyToMessageId: string,
-    opts?: { replyInThread?: boolean },
+    opts?: { replyInThread?: boolean; startedAtMs?: number },
   ): Promise<CardHandle> {
     let finishProducer!: () => void;
     const producerLifetime = new Promise<void>((resolve) => {
@@ -274,7 +302,13 @@ export class CardRenderer {
       await streamDone.catch(() => undefined);
       throw err;
     }
-    return new CardHandleImpl({ controller, finishProducer, streamDone });
+    return new CardHandleImpl({
+      controller,
+      finishProducer,
+      streamDone,
+      startedAtMs: opts?.startedAtMs ?? this.now(),
+      now: this.now,
+    });
   }
 }
 
@@ -283,6 +317,7 @@ export {
   FAILURE_MARKER as _FAILURE_MARKER,
   INTERRUPTED_MARKER as _INTERRUPTED_MARKER,
   liveMarkdown as _liveMarkdown,
+  formatDuration as _formatDuration,
   optimizeMarkdownStyle as _optimizeMarkdownStyle,
   terminalMarkdown as _terminalMarkdown,
 };

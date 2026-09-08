@@ -137,9 +137,14 @@ describe("BridgeHandler.handleOne", () => {
     await makeHandler(deps).run();
     await waitFor(() => deps.card.finalizeArgs !== undefined);
 
-    expect(deps.cardRenderer.start).toHaveBeenCalledWith("oc_1", "om_top", {
-      replyInThread: true,
-    });
+    expect(deps.cardRenderer.start).toHaveBeenCalledWith(
+      "oc_1",
+      "om_top",
+      expect.objectContaining({
+        replyInThread: true,
+        startedAtMs: expect.any(Number),
+      }),
+    );
     expect(deps.card.finalizeArgs).toMatchObject({ success: true, finalText: "答案是 4" });
     expect(store.get("om_top")?.sessionId).toBe("sess_new");
   });

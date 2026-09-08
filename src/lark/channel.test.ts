@@ -206,7 +206,12 @@ describe("native streaming card history", () => {
       _historyMessageText({
         message_id: "om_card",
         msg_type: "interactive",
-        body: { content: content(false, "> ✅ **回复完成**\n\n最终答案") },
+        body: {
+          content: content(
+            false,
+            "> ✅ **回复完成**\n> ⏱️ 处理耗时：1 分钟 5 秒\n\n最终答案",
+          ),
+        },
       }),
     ).toBe("最终答案");
   });

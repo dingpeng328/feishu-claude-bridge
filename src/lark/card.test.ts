@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { AgentStreamEvent } from "../claude/runner.js";
 import {
   CardRenderer,
+  _formatDuration,
   _liveMarkdown,
   _optimizeMarkdownStyle,
   _terminalMarkdown,
@@ -9,7 +10,7 @@ import {
   type OutboundCardClient,
 } from "./card.js";
 
-function makeHarness() {
+function makeHarness(now: () => number = () => 0) {
   const updates: string[] = [];
   const controller: MarkdownStreamController = {
     messageId: "om_stream",
@@ -23,7 +24,7 @@ function makeHarness() {
       return { messageId: controller.messageId };
     }),
   };
-  return { renderer: new CardRenderer({ outbound }), outbound, controller, updates };
+  return { renderer: new CardRenderer({ outbound, now }), outbound, controller, updates };
 }
 
 describe("CardRenderer native markdown stream", () => {
@@ -62,7 +63,9 @@ describe("CardRenderer native markdown stream", () => {
 
     await card.finalize({ success: true });
 
-    expect(updates.at(-1)).toBe("> ✅ **回复完成**\n\n#### 最终答案\n\n内容");
+    expect(updates.at(-1)).toBe(
+      "> ✅ **回复完成**\n> ⏱️ 处理耗时：不到 1 秒\n\n#### 最终答案\n\n内容",
+    );
   });
 
   it("keeps multiple assistant turns separated", async () => {
@@ -73,7 +76,22 @@ describe("CardRenderer native markdown stream", () => {
 
     await card.finalize({ success: true });
 
-    expect(updates.at(-1)).toBe("> ✅ **回复完成**\n\n第一段\n\n第二段");
+    expect(updates.at(-1)).toBe(
+      "> ✅ **回复完成**\n> ⏱️ 处理耗时：不到 1 秒\n\n第一段\n\n第二段",
+    );
+  });
+
+  it("shows elapsed processing time when the stream finishes", async () => {
+    let nowMs = 1_000;
+    const { renderer, updates } = makeHarness(() => nowMs);
+    const card = await renderer.start("oc_chat", "om_user", { startedAtMs: nowMs });
+    nowMs += 65_000;
+
+    await card.finalize({ success: true, finalText: "完成" });
+
+    expect(updates.at(-1)).toBe(
+      "> ✅ **回复完成**\n> ⏱️ 处理耗时：1 分钟 5 秒\n\n完成",
+    );
   });
 
   it("shows only generic pre-answer progress and never exposes tool input", async () => {
@@ -118,7 +136,22 @@ describe("markdown presentation", () => {
   });
 
   it("adds a compact interruption state below partial output", () => {
-    expect(_terminalMarkdown({ bodyText: "已有内容", success: false, interrupted: true }))
-      .toBe("> ⏸️ **已被新消息打断**\n> 正在按新消息继续处理。\n\n已有内容");
+    expect(
+      _terminalMarkdown({
+        bodyText: "已有内容",
+        success: false,
+        interrupted: true,
+        elapsedMs: 2500,
+      }),
+    ).toBe(
+      "> ⏸️ **已被新消息打断**\n> ⏱️ 处理耗时：3 秒\n> 正在按新消息继续处理。\n\n已有内容",
+    );
+  });
+
+  it("formats durations across seconds, minutes, and hours", () => {
+    expect(_formatDuration(999)).toBe("不到 1 秒");
+    expect(_formatDuration(42_400)).toBe("42 秒");
+    expect(_formatDuration(65_100)).toBe("1 分钟 5 秒");
+    expect(_formatDuration(3_661_000)).toBe("1 小时 1 分钟 1 秒");
   });
 });
