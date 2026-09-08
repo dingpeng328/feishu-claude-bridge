@@ -1,10 +1,12 @@
 /**
  * src/claude/sessionStore.ts
  *
- * threadId ↔ agent session_id persistence for a single bot. There is no
- * version/migration layer because this store has only one key scheme.
+ * threadId ↔ agent session_id runtime state for a single bot. The file is
+ * flushed after every change, but main.ts starts each bridge process with an
+ * empty store so sessions are never resumed across a restart.
  *
  *   - load(): missing file → fresh empty store (writes an empty file)
+ *   - load({ discardExisting: true }) → fresh empty store for a new runtime
  *   - put()/delete() → immediate atomic flush (write .tmp, then rename)
  *   - close() → no-op flush hook (kept for symmetry with main.ts shutdown)
  */
@@ -25,6 +27,11 @@ interface StoreFile {
   records: Record<string, SessionRecord>;
 }
 
+interface LoadOptions {
+  /** Ignore and replace records written by an earlier bridge process. */
+  discardExisting?: boolean;
+}
+
 export class SessionStore {
   readonly #filePath: string;
   readonly #map: Map<string, SessionRecord>;
@@ -34,8 +41,14 @@ export class SessionStore {
     this.#map = map;
   }
 
-  /** Load sessions.json, or create a fresh empty store if the file is absent. */
-  static async load(filePath: string): Promise<SessionStore> {
+  /** Load sessions.json, or create a fresh empty store if requested/absent. */
+  static async load(filePath: string, options: LoadOptions = {}): Promise<SessionStore> {
+    if (options.discardExisting === true) {
+      const store = new SessionStore(filePath, new Map());
+      await store.#flush();
+      return store;
+    }
+
     let raw: string;
     try {
       raw = await readFile(filePath, "utf8");

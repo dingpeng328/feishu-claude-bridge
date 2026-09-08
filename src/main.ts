@@ -102,7 +102,10 @@ async function main(): Promise<void> {
     allowedChatIds: config.allowedChatIds,
     deliveryStatePath: config.deliveryPath,
   });
-  const sessionStore = await SessionStore.load(config.sessionsPath);
+  // A bridge restart is a hard agent-session boundary. Keep reusing sessions
+  // created during this process, but never resume an id persisted by an older
+  // process (the Feishu topic snapshot still supplies visible conversation text).
+  const sessionStore = await SessionStore.load(config.sessionsPath, { discardExisting: true });
   const cardRenderer = new CardRenderer({
     outbound: client.outboundCardClient(),
   });

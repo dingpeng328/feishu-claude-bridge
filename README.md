@@ -21,7 +21,7 @@
    9. sessionStore.put       存 sessionId,下一轮续接同一对话
 ```
 
-- **话题续接**：顶楼 @bot 开一个话题；话题内再次 @bot 的回复(有 `root_id`)归到同一 `threadId` → 命中同一 agent session → Claude 用 `--resume`，Codex 用 `codex exec resume`。每次话题内 @bot 时，还会重新分页拉取首楼和全部话题回复，因此期间未 @bot 的普通讨论也会进入本轮上下文。
+- **话题续接**：顶楼 @bot 开一个话题；在同一次 bridge 运行期间，话题内再次 @bot 的回复(有 `root_id`)归到同一 `threadId` → 命中同一 agent session → Claude 用 `--resume`，Codex 用 `codex exec resume`。bridge 每次启动都会清空上一次运行保存的 session 映射，所以重启后收到的第一条消息一定创建新的 agent session。每次话题内 @bot 时，还会重新分页拉取首楼和全部话题回复，因此期间未 @bot 的普通讨论也会进入本轮上下文。
 - **群消息触发**：群聊和群话题中的每一条消息都必须直接 @bot 才会触发处理；未 @ 的普通讨论不会单独触发，但会在下一次话题内 @bot 时被一并读取。使用 `@bot 已解决`、`@bot done` 等结束词可以清理该话题的 agent session。
 - **本机登录态**：复用你本机 CLI 的登录。Claude 模式下 bridge 会主动剥掉 `ANTHROPIC_API_KEY`，避免切到 API 计费。
 - **共享 cwd**：默认 `~/.feishu-claude-bridge/work`；也可以设成某个项目仓库，让 agent 读写代码、执行命令。
@@ -81,7 +81,7 @@ macOS 的节能 / **App Nap** 会把空闲或后台的 node 进程挂起 → 飞
 这是飞书长连接服务的部署前提,笔记本本质上不适合长驻。Linux 无此节能问题,`bin/start.sh`
 会自动跳过 caffeinate 直接运行。
 
-跑起来后，在群里 **@机器人** 发一句话 → 它会开一个**话题**并刷新出回复卡片。后续在该话题里每次都需要再次 **@机器人** 才会触发；触发后 bridge 会拉取首楼和全部回复（包括期间未 @ 的普通讨论），再交给同一个本地 Codex session 综合回答。发送 `@机器人 已解决` / `@机器人 done` 等结束词可清理该话题会话。
+跑起来后，在群里 **@机器人** 发一句话 → 它会开一个**话题**并刷新出回复卡片。后续在该话题里每次都需要再次 **@机器人** 才会触发；触发后 bridge 会拉取首楼和全部回复（包括期间未 @ 的普通讨论），再交给当前 bridge 进程内该话题的 Codex session 综合回答。重启 bridge 后，即使是原话题的新消息也会从新 session 开始；飞书话题文本仍会被拉取作为可见上下文。发送 `@机器人 已解决` / `@机器人 done` 等结束词可清理该话题会话。
 
 bridge 有三层丢消息保护：官方 SDK 负责底层 ping/pong，并以 15 秒超时识别未响应连接；独立 keepalive 每 15 秒检查连接状态，连续 3 次异常且飞书网络可达时强制重连；bridge 每 20 分钟主动刷新一次长连接，并每 60 秒通过历史消息接口补拉遗漏的直接 @。补拉游标和 `message_id` 去重记录持久化在 `~/.feishu-claude-bridge/delivery-state.json`。对于从另一台机器或旧游标再次刷入的话题消息，bridge 还会检查共享的话题历史：若当前机器人已在该消息之后成功回复过，则跳过重复执行；仍处于处理中、被打断或失败的卡片不会阻止重试，机器人对更早消息的回复也不会阻止后来新发的 @。运行日志同时写入 `~/.feishu-claude-bridge/bridge.log`，不再只存在于启动终端。
 

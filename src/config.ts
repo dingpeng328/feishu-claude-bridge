@@ -42,7 +42,7 @@ export interface Config {
   allowedChatIds: Set<string>;
   /** Shared cwd the agent subprocess runs in (same for all topics). */
   workDir: string;
-  /** Path to the sessions.json persistence file (stable, under HOME_DIR). */
+  /** Path to the current-runtime sessions.json snapshot (stable, under HOME_DIR). */
   sessionsPath: string;
   /** Single-instance lock file path (stable, under HOME_DIR). */
   pidPath: string;

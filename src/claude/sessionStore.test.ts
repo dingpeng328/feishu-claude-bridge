@@ -30,6 +30,24 @@ describe("SessionStore", () => {
     expect(reloaded.get("om_t")?.sessionId).toBe("sess_1");
   });
 
+  it("discards sessions from an earlier runtime when requested", async () => {
+    const previousRuntime = await SessionStore.load(file);
+    await previousRuntime.put({
+      threadId: "om_old",
+      sessionId: "sess_old",
+      createdTs: 1,
+      lastActiveTs: 2,
+    });
+
+    const newRuntime = await SessionStore.load(file, { discardExisting: true });
+    expect(newRuntime.get("om_old")).toBeUndefined();
+    expect(newRuntime.list()).toHaveLength(0);
+
+    // The reset is durable too: no later load can accidentally revive the old id.
+    const reloaded = await SessionStore.load(file);
+    expect(reloaded.list()).toHaveLength(0);
+  });
+
   it("delete removes the record", async () => {
     const store = await SessionStore.load(file);
     await store.put({ threadId: "om_t", sessionId: "sess_1", createdTs: 1, lastActiveTs: 2 });
