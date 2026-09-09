@@ -12,6 +12,8 @@ import {
 
 function makeHarness(now: () => number = () => 0) {
   const updates: string[] = [];
+  const replacements: object[] = [];
+  let storedMarkdown: string | undefined;
   const controller: MarkdownStreamController = {
     messageId: "om_stream",
     setContent: vi.fn(async (content: string) => {
@@ -23,8 +25,20 @@ function makeHarness(now: () => number = () => 0) {
       await producer(controller);
       return { messageId: controller.messageId };
     }),
+    replaceCard: vi.fn(async (_messageId, card) => {
+      replacements.push(card);
+      const body = card as { body?: { elements?: Array<{ content?: string }> } };
+      storedMarkdown = body.body?.elements?.[0]?.content;
+    }),
+    readCardMarkdown: vi.fn(async () => storedMarkdown),
   };
-  return { renderer: new CardRenderer({ outbound, now }), outbound, controller, updates };
+  return {
+    renderer: new CardRenderer({ outbound, now, sleep: async () => undefined }),
+    outbound,
+    controller,
+    updates,
+    replacements,
+  };
 }
 
 describe("CardRenderer native markdown stream", () => {
@@ -43,6 +57,15 @@ describe("CardRenderer native markdown stream", () => {
       expect.any(Function),
     );
     await card.finalize({ success: true, finalText: "完成" });
+
+    expect(outbound.replaceCard).toHaveBeenCalledWith(
+      "om_stream",
+      expect.objectContaining({
+        schema: "2.0",
+        config: expect.objectContaining({ streaming_mode: false }),
+      }),
+    );
+    expect(outbound.readCardMarkdown).toHaveBeenCalledWith("om_stream");
   });
 
   it("replaces partial snapshots and commits clean final markdown", async () => {
@@ -117,10 +140,85 @@ describe("CardRenderer native markdown stream", () => {
       streamMarkdown: vi.fn(async () => {
         throw new Error("card create failed");
       }),
+      replaceCard: vi.fn(),
+      readCardMarkdown: vi.fn(),
     };
     const renderer = new CardRenderer({ outbound });
 
     await expect(renderer.start("oc_chat", "om_user")).rejects.toThrow("card create failed");
+  });
+
+  it("retries the authoritative final-card replacement after transient failures", async () => {
+    const { renderer, outbound } = makeHarness();
+    vi.mocked(outbound.replaceCard)
+      .mockRejectedValueOnce(new Error("rate limited"))
+      .mockRejectedValueOnce(new Error("upstream timeout"));
+    const card = await renderer.start("oc_chat", "om_user");
+
+    await card.finalize({ success: true, finalText: "最终答案" });
+
+    expect(outbound.replaceCard).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not create a second message when the original card cannot be finalized", async () => {
+    const { renderer, outbound } = makeHarness();
+    vi.mocked(outbound.replaceCard).mockRejectedValue(new Error("card unavailable"));
+    const card = await renderer.start("oc_chat", "om_user", { replyInThread: false });
+
+    await expect(
+      card.finalize({ success: true, finalText: "不能丢的最终答案" }),
+    ).rejects.toThrow("card finalization failed for original message om_stream");
+
+    expect(outbound.replaceCard).toHaveBeenCalledTimes(3);
+  });
+
+  it("refreshes only the original card when readback initially misses the terminal state", async () => {
+    const { renderer, outbound } = makeHarness();
+    vi.mocked(outbound.readCardMarkdown)
+      .mockResolvedValueOnce("> ⏳ **正在处理**")
+      .mockResolvedValueOnce("> ⏳ **正在处理**")
+      .mockResolvedValueOnce("> ⏳ **正在处理**");
+    const card = await renderer.start("oc_chat", "om_user");
+
+    await card.finalize({ success: true, finalText: "最终答案" });
+
+    expect(outbound.replaceCard).toHaveBeenCalledTimes(2);
+    expect(outbound.readCardMarkdown).toHaveBeenCalledTimes(4);
+  });
+
+  it("finalizes concurrent cards independently without mixing their content", async () => {
+    const stored = new Map<string, string>();
+    const replaceCard = vi.fn(async (messageId: string, card: object) => {
+      const body = card as { body?: { elements?: Array<{ content?: string }> } };
+      stored.set(messageId, body.body?.elements?.[0]?.content ?? "");
+    });
+    const outbound: OutboundCardClient = {
+      streamMarkdown: vi.fn(async (_chatId, replyTo, _opts, producer) => {
+        const controller: MarkdownStreamController = {
+          messageId: `card_${replyTo}`,
+          setContent: vi.fn(async () => undefined),
+        };
+        await producer(controller);
+        return { messageId: controller.messageId };
+      }),
+      replaceCard,
+      readCardMarkdown: vi.fn(async (messageId) => stored.get(messageId)),
+    };
+    const renderer = new CardRenderer({ outbound, sleep: async () => undefined });
+    const cards = await Promise.all([
+      renderer.start("oc_chat", "om_user_1"),
+      renderer.start("oc_chat", "om_user_2"),
+      renderer.start("oc_chat", "om_user_3"),
+    ]);
+
+    await Promise.all(
+      cards.map((card, index) => card.finalize({ success: true, finalText: `答案 ${index + 1}` })),
+    );
+
+    expect(replaceCard).toHaveBeenCalledTimes(3);
+    expect(stored.get("card_om_user_1")).toContain("答案 1");
+    expect(stored.get("card_om_user_2")).toContain("答案 2");
+    expect(stored.get("card_om_user_3")).toContain("答案 3");
   });
 });
 

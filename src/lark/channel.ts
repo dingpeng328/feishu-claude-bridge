@@ -57,6 +57,7 @@ interface LarkChannel {
   on(event: "error", handler: (err: { code?: string; message?: string }) => void): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
+  updateCard(messageId: string, card: object): Promise<void>;
   stream(
     chatId: string,
     input: {
@@ -80,7 +81,10 @@ interface LarkChannel {
           }>;
         };
         message: {
-          get(payload: { path: { message_id: string } }): Promise<{
+          get(payload: {
+            params?: { card_msg_content_type?: "raw_card_content"; with_sender_name?: boolean };
+            path: { message_id: string };
+          }): Promise<{
             code?: number;
             msg?: string;
             data?: { items?: ApiMessageItem[] };
@@ -1028,6 +1032,30 @@ export class ChannelClient {
             replyInThread: opts.replyInThread,
           },
         );
+      },
+      async replaceCard(messageId, card) {
+        await withTimeout(
+          getChannel().updateCard(messageId, card),
+          SDK_TIMEOUT_MS,
+          `replace final card ${messageId}`,
+        );
+      },
+      async readCardMarkdown(messageId) {
+        const res = await withTimeout(
+          getChannel().rawClient.im.v1.message.get({
+            params: { card_msg_content_type: "raw_card_content", with_sender_name: false },
+            path: { message_id: messageId },
+          }),
+          SDK_TIMEOUT_MS,
+          `read final card ${messageId}`,
+        );
+        if (res.code && res.code !== 0) {
+          throw new Error(`${res.code}: ${res.msg ?? "message.get failed"}`);
+        }
+        const item = res.data?.items?.find((candidate) => candidate.message_id === messageId)
+          ?? res.data?.items?.[0];
+        if (item?.msg_type !== "interactive" || !item.body?.content) return undefined;
+        return interactiveCardText(item.body.content) || undefined;
       },
     };
   }

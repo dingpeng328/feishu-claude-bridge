@@ -18,12 +18,18 @@ export interface OutboundCardClient {
     opts: { replyInThread: boolean },
     producer: (controller: MarkdownStreamController) => Promise<void>,
   ): Promise<{ messageId: string }>;
+  /** Force-replace the streamed message with an ordinary, non-streaming card. */
+  replaceCard(messageId: string, card: object): Promise<void>;
+  /** Read the rendered markdown stored by Feishu for final-state verification. */
+  readCardMarkdown(messageId: string): Promise<string | undefined>;
 }
 
 export interface CardRendererOptions {
   outbound: OutboundCardClient;
   /** Injectable clock for deterministic duration rendering in tests. */
   now?: () => number;
+  /** Injectable sleep for deterministic retry tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface CardHandle {
@@ -45,6 +51,40 @@ const INTERRUPTED_MARKER = "**已被新消息打断**";
 const PROCESSING_STATUS = "> ⏳ **正在处理**";
 const SUCCESS_STATUS = "> ✅ **回复完成**";
 export const INITIAL_STREAM_TEXT = `${PROCESSING_STATUS}\n> Agent 正在思考或执行任务...`;
+const STATIC_FINAL_CARD_MAX_CHARS = 29_000;
+const FINAL_REPLACE_ATTEMPTS = 3;
+const FINAL_RETRY_BASE_DELAY_MS = 300;
+const FINAL_VERIFY_ATTEMPTS = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function conciseError(err: unknown): string {
+  const responseData = (err as { response?: { data?: { code?: unknown; msg?: unknown } } })?.response?.data;
+  if (responseData && (responseData.code !== undefined || responseData.msg !== undefined)) {
+    return `${String(responseData.code ?? "api_error")}: ${String(responseData.msg ?? "request failed")}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+function truncateSummary(text: string, max = 50): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  return cleaned.length <= max ? cleaned : `${cleaned.slice(0, max - 1)}…`;
+}
+
+function staticFinalCard(markdown: string): object {
+  return {
+    schema: "2.0",
+    config: {
+      streaming_mode: false,
+      summary: { content: truncateSummary(markdown) },
+    },
+    body: {
+      elements: [{ tag: "markdown", element_id: "stream_md", content: markdown }],
+    },
+  };
+}
 
 /** Remove raw tool-call markup that can occasionally leak into model text. */
 function stripLeakedToolMarkup(text: string): string {
@@ -154,8 +194,10 @@ class CardHandleImpl implements CardHandle {
   private readonly controller: MarkdownStreamController;
   private readonly finishProducer: () => void;
   private readonly streamDone: Promise<{ messageId: string }>;
+  private readonly outbound: OutboundCardClient;
   private readonly startedAtMs: number;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private finalized = false;
   private finalizePromise: Promise<void> | undefined;
   private updateTail: Promise<void> = Promise.resolve();
@@ -165,15 +207,19 @@ class CardHandleImpl implements CardHandle {
     controller: MarkdownStreamController;
     finishProducer: () => void;
     streamDone: Promise<{ messageId: string }>;
+    outbound: OutboundCardClient;
     startedAtMs: number;
     now: () => number;
+    sleep: (ms: number) => Promise<void>;
   }) {
     this.messageId = opts.controller.messageId;
     this.controller = opts.controller;
     this.finishProducer = opts.finishProducer;
     this.streamDone = opts.streamDone;
+    this.outbound = opts.outbound;
     this.startedAtMs = opts.startedAtMs;
     this.now = opts.now;
+    this.sleep = opts.sleep;
   }
 
   handle(event: AgentStreamEvent): void {
@@ -237,29 +283,119 @@ class CardHandleImpl implements CardHandle {
       elapsedMs: Math.max(0, this.now() - this.startedAtMs),
     });
 
-    let finalUpdateError: unknown;
+    let nativeStreamError: unknown;
     try {
       await this.updateTail.catch(() => undefined);
       await this.controller.setContent(content);
     } catch (err) {
-      finalUpdateError = err;
+      nativeStreamError = err;
     } finally {
       // The SDK finalizes CardKit only after the producer settles.
       this.finishProducer();
     }
 
-    await this.streamDone;
-    if (finalUpdateError) throw finalUpdateError;
+    try {
+      await this.streamDone;
+    } catch (err) {
+      nativeStreamError ??= err;
+    }
+
+    // @larksuite/channel's native markdown stream intentionally swallows
+    // element-update/final-settings failures. One transient update also marks
+    // that stream failed and suppresses every later snapshot. Therefore a
+    // resolved stream promise alone is not proof that the final answer reached
+    // the message. Force one ordinary full-card update after the native stream
+    // settles; this also emits a fresh message-update event for clients whose
+    // typewriter renderer got stuck on an older snapshot.
+    try {
+      if (content.length <= STATIC_FINAL_CARD_MAX_CHARS) {
+        await this.replaceFinalCardWithRetry(content);
+      }
+      let verified = await this.verifyFinalMarkdown(content);
+      // A successful CardKit update can become visible slightly before the
+      // message-read API returns the new raw card. If the first verification
+      // window misses it, refresh the SAME message once more; never create a
+      // second reply merely because readback lagged.
+      if (!verified && content.length <= STATIC_FINAL_CARD_MAX_CHARS) {
+        console.warn(
+          `[card] final card readback lagged; refreshing original message_id=${this.messageId}`,
+        );
+        await this.replaceFinalCardWithRetry(content);
+        verified = await this.verifyFinalMarkdown(content);
+      }
+      if (!verified) {
+        throw new Error(`final card readback did not match message_id=${this.messageId}`);
+      }
+      if (nativeStreamError !== undefined) {
+        console.warn(
+          `[card] native stream finalization failed but static final card recovered message_id=${this.messageId}: ${conciseError(nativeStreamError)}`,
+        );
+      }
+      console.log(`[card] final card verified message_id=${this.messageId}`);
+      return;
+    } catch (replaceErr) {
+      console.error(
+        `[card] final card commit not confirmed message_id=${this.messageId}: ${conciseError(replaceErr)}`,
+      );
+      throw new AggregateError(
+        [nativeStreamError, replaceErr].filter((err) => err !== undefined),
+        `card finalization failed for original message ${this.messageId}`,
+      );
+    }
+  }
+
+  private async replaceFinalCardWithRetry(content: string): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= FINAL_REPLACE_ATTEMPTS; attempt++) {
+      try {
+        await this.outbound.replaceCard(this.messageId, staticFinalCard(content));
+        return;
+      } catch (err) {
+        lastError = err;
+        if (attempt === FINAL_REPLACE_ATTEMPTS) break;
+        const delayMs = FINAL_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+        console.warn(
+          `[card] final card update attempt ${attempt} failed message_id=${this.messageId}; retrying in ${delayMs}ms: ${conciseError(err)}`,
+        );
+        await this.sleep(delayMs);
+      }
+    }
+    throw lastError;
+  }
+
+  private async verifyFinalMarkdown(content: string): Promise<boolean> {
+    // Feishu may normalize the stored Markdown around quotes/blank lines, so
+    // byte-for-byte equality creates false negatives. The first line is the
+    // unambiguous success/failure/interruption marker and is also present on the
+    // head card when a long stream rolls over.
+    const expected = content.split("\n", 1)[0]?.trim() ?? "";
+    for (let attempt = 1; attempt <= FINAL_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const actual = (await this.outbound.readCardMarkdown(this.messageId))?.trim();
+        if (actual?.includes(expected)) return true;
+      } catch (err) {
+        if (attempt === FINAL_VERIFY_ATTEMPTS) {
+          console.warn(
+            `[card] final card readback failed message_id=${this.messageId}: ${conciseError(err)}`,
+          );
+          return false;
+        }
+      }
+      if (attempt < FINAL_VERIFY_ATTEMPTS) await this.sleep(FINAL_RETRY_BASE_DELAY_MS * attempt);
+    }
+    return false;
   }
 }
 
 export class CardRenderer {
   private readonly outbound: OutboundCardClient;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(opts: CardRendererOptions) {
     this.outbound = opts.outbound;
     this.now = opts.now ?? Date.now;
+    this.sleep = opts.sleep ?? sleep;
   }
 
   async start(
@@ -306,8 +442,10 @@ export class CardRenderer {
       controller,
       finishProducer,
       streamDone,
+      outbound: this.outbound,
       startedAtMs: opts?.startedAtMs ?? this.now(),
       now: this.now,
+      sleep: this.sleep,
     });
   }
 }

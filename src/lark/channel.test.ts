@@ -226,6 +226,65 @@ describe("native streaming card history", () => {
   });
 });
 
+describe("ChannelClient final-card recovery transport", () => {
+  it("replaces and reads back the original card", async () => {
+    const updateCard = vi.fn(async () => undefined);
+    const get = vi.fn(async () => ({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_card",
+            msg_type: "interactive",
+            body: {
+              content: JSON.stringify({
+                card_schema: "2.0",
+                json_card: JSON.stringify({
+                  schema: "2.0",
+                  body: {
+                    elements: [
+                      {
+                        property: {
+                          tag: "markdown",
+                          element_id: "stream_md",
+                          content: "> ✅ **回复完成**\n\n最终答案",
+                        },
+                      },
+                    ],
+                  },
+                }),
+              }),
+            },
+          },
+        ],
+      },
+    }));
+    const client = new ChannelClient({
+      appId: "app",
+      appSecret: "secret",
+      allowedChatIds: new Set(),
+      deliveryStatePath: "/tmp/fcb-channel-test-delivery.json",
+    });
+    (client as unknown as { channel: unknown }).channel = {
+      updateCard,
+      rawClient: { im: { v1: { message: { get } } } },
+    };
+    const outbound = client.outboundCardClient();
+    const finalCard = { schema: "2.0", body: { elements: [] } };
+
+    await outbound.replaceCard("om_card", finalCard);
+    expect(updateCard).toHaveBeenCalledWith("om_card", finalCard);
+
+    await expect(outbound.readCardMarkdown("om_card")).resolves.toBe(
+      "> ✅ **回复完成**\n\n最终答案",
+    );
+    expect(get).toHaveBeenCalledWith({
+      params: { card_msg_content_type: "raw_card_content", with_sender_name: false },
+      path: { message_id: "om_card" },
+    });
+  });
+});
+
 describe("apiMessageToLarkEvent", () => {
   const item = {
     message_id: "om_recovered",
