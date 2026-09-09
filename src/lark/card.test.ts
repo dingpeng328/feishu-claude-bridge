@@ -31,6 +31,7 @@ function makeHarness(now: () => number = () => 0) {
       storedMarkdown = body.body?.elements?.[0]?.content;
     }),
     readCardMarkdown: vi.fn(async () => storedMarkdown),
+    releaseCard: vi.fn(),
   };
   return {
     renderer: new CardRenderer({ outbound, now, sleep: async () => undefined }),
@@ -66,6 +67,7 @@ describe("CardRenderer native markdown stream", () => {
       }),
     );
     expect(outbound.readCardMarkdown).toHaveBeenCalledWith("om_stream");
+    expect(outbound.releaseCard).toHaveBeenCalledWith("om_stream");
   });
 
   it("replaces partial snapshots and commits clean final markdown", async () => {

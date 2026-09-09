@@ -58,6 +58,7 @@ interface LarkChannel {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   updateCard(messageId: string, card: object): Promise<void>;
+  updateCardById(cardId: string, card: object, sequence: number): Promise<void>;
   stream(
     chatId: string,
     input: {
@@ -110,6 +111,17 @@ interface LarkChannel {
       };
     };
   };
+}
+
+/**
+ * Runtime fields carried by the pinned SDK's native markdown controller.
+ * They are intentionally kept behind this narrow adapter: the public SDK type
+ * omits them, but they identify the CardKit entity that the message references.
+ */
+interface NativeCardKitController {
+  readonly messageId: string;
+  readonly cardId?: string;
+  sequence?: number;
 }
 
 const THREAD_HISTORY_TIMEOUT_MS = 15_000;
@@ -255,6 +267,40 @@ function fieldString(value: Record<string, unknown>, key: string): string | unde
   return typeof found === "string" ? found : undefined;
 }
 
+function directRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function directString(value: Record<string, unknown> | undefined, key: string): string | undefined {
+  const found = value?.[key];
+  return typeof found === "string" ? found : undefined;
+}
+
+/** Reconstruct text from Feishu's compiled CardKit markdown element tree. */
+function compiledCardText(value: unknown): string {
+  if (Array.isArray(value)) return value.map(compiledCardText).join("");
+  const record = directRecord(value);
+  if (!record) return "";
+  const property = directRecord(record["property"]);
+  const tag = directString(record, "tag") ?? directString(property, "tag");
+  if (tag === "br") return "\n";
+
+  const content = directString(record, "content") ?? directString(property, "content");
+  if (content !== undefined) return content;
+
+  const elements = property?.["elements"] ?? record["elements"];
+  if (Array.isArray(elements)) {
+    const text = elements.map(compiledCardText).join("");
+    return tag === "blockquote" ? `${text}\n` : text;
+  }
+
+  const items = property?.["items"] ?? record["items"];
+  if (Array.isArray(items)) return `${items.map(compiledCardText).join("\n")}\n`;
+  return "";
+}
+
 function cardMarkdownContents(card: Record<string, unknown>): string[] {
   const contents: string[] = [];
   const visit = (value: unknown): void => {
@@ -264,10 +310,18 @@ function cardMarkdownContents(card: Record<string, unknown>): string[] {
     }
     if (typeof value !== "object" || value === null) return;
     const record = value as Record<string, unknown>;
-    const tag = fieldString(record, "tag");
-    const elementId = fieldString(record, "element_id");
+    const property = directRecord(record["property"]);
+    const tag = directString(record, "tag") ?? directString(property, "tag");
+    const elementId =
+      directString(record, "element_id")
+      ?? directString(record, "elementId")
+      ?? directString(property, "element_id")
+      ?? directString(property, "elementId");
     if (tag === "markdown" || elementId === "stream_md") {
-      const content = fieldString(record, "content");
+      const content =
+        directString(record, "content")
+        ?? directString(property, "content")
+        ?? compiledCardText(record);
       if (content?.trim()) contents.push(content.trim());
       return;
     }
@@ -275,6 +329,21 @@ function cardMarkdownContents(card: Record<string, unknown>): string[] {
   };
   visit(card["body"] ?? card);
   return contents;
+}
+
+function cardSummaryContent(card: Record<string, unknown>): string | undefined {
+  const config = directRecord(card["config"]);
+  return directString(directRecord(config?.["summary"]), "content");
+}
+
+function statusFromCardText(text: string): ThreadContextMessage["cardStatus"] {
+  if (text.includes("**处理失败**") || text.includes("处理失败")) return "failure";
+  if (text.includes("**已被新消息打断**") || text.includes("已被新消息打断")) {
+    return "interrupted";
+  }
+  if (text.includes("**回复完成**") || text.includes("回复完成")) return "success";
+  if (text.includes("**正在处理**") || text.includes("正在处理")) return "streaming";
+  return undefined;
 }
 
 function bridgeCardStatus(
@@ -295,15 +364,18 @@ function bridgeCardStatus(
     if (title?.startsWith("⏸️")) return "interrupted";
   }
 
-  const elementId = findCardField(card["body"], "element_id");
-  const streamingMode = findCardField(card["config"], "streaming_mode");
-  if (elementId !== "stream_md" || typeof streamingMode !== "boolean") return undefined;
-  if (streamingMode) return "streaming";
-
-  const markdown = cardMarkdownContents(card).join("\n\n");
-  if (markdown.includes("**处理失败**")) return "failure";
-  if (markdown.includes("**已被新消息打断**")) return "interrupted";
-  return "success";
+  const elementId =
+    findCardField(card["body"], "element_id") ?? findCardField(card["body"], "elementId");
+  const streamingMode =
+    findCardField(card["config"], "streaming_mode")
+    ?? findCardField(card["config"], "streamingMode");
+  const cardText = [cardSummaryContent(card), ...cardMarkdownContents(card)]
+    .filter((part): part is string => Boolean(part))
+    .join("\n\n");
+  const status = statusFromCardText(cardText);
+  if (elementId !== "stream_md" && status === undefined) return undefined;
+  if (streamingMode === true) return "streaming";
+  return status ?? (streamingMode === false ? "success" : undefined);
 }
 
 function interactiveCardText(content: string): string {
@@ -311,13 +383,30 @@ function interactiveCardText(content: string): string {
   return card ? cardMarkdownContents(card).join("\n\n") : "";
 }
 
+function interactiveCardVerificationText(content: string): string {
+  const card = parseInteractiveCard(content);
+  if (!card) return "";
+  return [cardSummaryContent(card), ...cardMarkdownContents(card)]
+    .filter((part): part is string => Boolean(part))
+    .join("\n\n");
+}
+
 function stripBridgeStatusBlock(markdown: string): string {
   const lines = markdown.split("\n");
-  if (!/^> (?:⏳ \*\*正在处理\*\*|✅ \*\*回复完成\*\*|❌ \*\*处理失败\*\*|⏸️ \*\*已被新消息打断\*\*)$/u.test(lines[0] ?? "")) {
+  const firstLine = lines[0]?.replace(/\s+/g, "") ?? "";
+  const rawStatus = /^> (?:⏳ \*\*正在处理\*\*|✅ \*\*回复完成\*\*|❌ \*\*处理失败\*\*|⏸️ \*\*已被新消息打断\*\*)$/u.test(lines[0] ?? "");
+  const compiledStatus = /^(?:⏳正在处理|✅回复完成|❌处理失败|⏸️已被新消息打断)$/u.test(firstLine);
+  if (!rawStatus && !compiledStatus) {
     return markdown;
   }
   let bodyStart = 1;
-  while (lines[bodyStart]?.startsWith("> ")) bodyStart++;
+  if (rawStatus) {
+    while (lines[bodyStart]?.startsWith("> ")) bodyStart++;
+  } else {
+    while (/^(?:⏱️|正在按新消息继续处理|请稍后重试)/u.test(lines[bodyStart] ?? "")) {
+      bodyStart++;
+    }
+  }
   while (lines[bodyStart] === "") bodyStart++;
   return lines.slice(bodyStart).join("\n").trim();
 }
@@ -1022,11 +1111,20 @@ export class ChannelClient {
       if (!this.channel) throw new Error("[channel] outbound called before connect()");
       return this.channel;
     };
+    const activeStreamCards = new Map<string, NativeCardKitController>();
     return {
       async streamMarkdown(chatId, replyToMessageId, opts, producer) {
         return getChannel().stream(
           chatId,
-          { markdown: producer },
+          {
+            markdown: async (controller) => {
+              const nativeController = controller as NativeCardKitController;
+              if (nativeController.cardId && typeof nativeController.sequence === "number") {
+                activeStreamCards.set(nativeController.messageId, nativeController);
+              }
+              await producer(controller);
+            },
+          },
           {
             replyTo: replyToMessageId,
             replyInThread: opts.replyInThread,
@@ -1034,6 +1132,17 @@ export class ChannelClient {
         );
       },
       async replaceCard(messageId, card) {
+        const nativeController = activeStreamCards.get(messageId);
+        if (nativeController?.cardId && typeof nativeController.sequence === "number") {
+          const sequence = nativeController.sequence + 1;
+          nativeController.sequence = sequence;
+          await withTimeout(
+            getChannel().updateCardById(nativeController.cardId, card, sequence),
+            SDK_TIMEOUT_MS,
+            `replace final CardKit entity ${messageId}`,
+          );
+          return;
+        }
         await withTimeout(
           getChannel().updateCard(messageId, card),
           SDK_TIMEOUT_MS,
@@ -1055,7 +1164,10 @@ export class ChannelClient {
         const item = res.data?.items?.find((candidate) => candidate.message_id === messageId)
           ?? res.data?.items?.[0];
         if (item?.msg_type !== "interactive" || !item.body?.content) return undefined;
-        return interactiveCardText(item.body.content) || undefined;
+        return interactiveCardVerificationText(item.body.content) || undefined;
+      },
+      releaseCard(messageId) {
+        activeStreamCards.delete(messageId);
       },
     };
   }

@@ -14,6 +14,44 @@ import {
 } from "./channel.js";
 import type { LarkMessageEvent } from "./transport.js";
 
+const compiledCardContent = JSON.stringify({
+  card_schema: 2,
+  json_card: JSON.stringify({
+    schema: "2.0",
+    source: "json",
+    config: {
+      streamingMode: false,
+      summary: { content: "> ✅ **回复完成** > ⏱️ 处理耗时：18 秒 最终答案" },
+    },
+    body: {
+      tag: "body",
+      property: {
+        elements: [
+          {
+            tag: "markdown",
+            property: {
+              elements: [
+                {
+                  tag: "blockquote",
+                  property: {
+                    elements: [
+                      { tag: "plain_text", property: { content: "✅" } },
+                      { tag: "plain_text", property: { content: "回复完成" } },
+                      { tag: "br" },
+                      { tag: "plain_text", property: { content: "⏱️ 处理耗时：18 秒" } },
+                    ],
+                  },
+                },
+                { tag: "plain_text", property: { content: "最终答案" } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  }),
+});
+
 describe("resolveStaleMs", () => {
   it("uses ctor value when given", () => {
     expect(resolveStaleMs(120_000)).toBe(120_000);
@@ -216,6 +254,17 @@ describe("native streaming card history", () => {
     ).toBe("最终答案");
   });
 
+  it("recognizes and extracts Feishu's compiled CardKit readback", () => {
+    expect(_bridgeCardStatus("interactive", compiledCardContent)).toBe("success");
+    expect(
+      _historyMessageText({
+        message_id: "om_compiled",
+        msg_type: "interactive",
+        body: { content: compiledCardContent },
+      }),
+    ).toBe("最终答案");
+  });
+
   it("does not classify an unrelated interactive card as a bridge reply", () => {
     const unrelated = JSON.stringify({
       schema: "2.0",
@@ -227,6 +276,50 @@ describe("native streaming card history", () => {
 });
 
 describe("ChannelClient final-card recovery transport", () => {
+  it("updates the CardKit entity referenced by the original streaming message", async () => {
+    const nativeController = {
+      messageId: "om_stream",
+      cardId: "card_entity",
+      sequence: 4,
+      setContent: vi.fn(async () => undefined),
+    };
+    const stream = vi.fn(
+      async (
+        _chatId: string,
+        input: { markdown: (controller: typeof nativeController) => Promise<void> },
+      ) => {
+        await input.markdown(nativeController);
+        nativeController.sequence++;
+        return { messageId: nativeController.messageId };
+      },
+    );
+    const updateCardById = vi.fn(async () => undefined);
+    const updateCard = vi.fn(async () => undefined);
+    const client = new ChannelClient({
+      appId: "app",
+      appSecret: "secret",
+      allowedChatIds: new Set(),
+      deliveryStatePath: "/tmp/fcb-channel-test-delivery.json",
+    });
+    (client as unknown as { channel: unknown }).channel = {
+      stream,
+      updateCard,
+      updateCardById,
+    };
+    const outbound = client.outboundCardClient();
+    const finalCard = { schema: "2.0", config: { streaming_mode: false } };
+
+    await outbound.streamMarkdown("oc_chat", "om_user", { replyInThread: true }, async () => {});
+    await outbound.replaceCard("om_stream", finalCard);
+
+    expect(updateCardById).toHaveBeenCalledWith("card_entity", finalCard, 6);
+    expect(updateCard).not.toHaveBeenCalled();
+
+    outbound.releaseCard?.("om_stream");
+    await outbound.replaceCard("om_stream", finalCard);
+    expect(updateCard).toHaveBeenCalledWith("om_stream", finalCard);
+  });
+
   it("replaces and reads back the original card", async () => {
     const updateCard = vi.fn(async () => undefined);
     const get = vi.fn(async () => ({
@@ -282,6 +375,34 @@ describe("ChannelClient final-card recovery transport", () => {
       params: { card_msg_content_type: "raw_card_content", with_sender_name: false },
       path: { message_id: "om_card" },
     });
+  });
+
+  it("reads the terminal marker from compiled CardKit summary content", async () => {
+    const get = vi.fn(async () => ({
+      code: 0,
+      data: {
+        items: [
+          {
+            message_id: "om_compiled",
+            msg_type: "interactive",
+            body: { content: compiledCardContent },
+          },
+        ],
+      },
+    }));
+    const client = new ChannelClient({
+      appId: "app",
+      appSecret: "secret",
+      allowedChatIds: new Set(),
+      deliveryStatePath: "/tmp/fcb-channel-test-delivery.json",
+    });
+    (client as unknown as { channel: unknown }).channel = {
+      rawClient: { im: { v1: { message: { get } } } },
+    };
+
+    await expect(client.outboundCardClient().readCardMarkdown("om_compiled")).resolves.toContain(
+      "> ✅ **回复完成**",
+    );
   });
 });
 

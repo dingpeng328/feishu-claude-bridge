@@ -22,6 +22,8 @@ export interface OutboundCardClient {
   replaceCard(messageId: string, card: object): Promise<void>;
   /** Read the rendered markdown stored by Feishu for final-state verification. */
   readCardMarkdown(messageId: string): Promise<string | undefined>;
+  /** Release transport metadata retained only for this active stream. */
+  releaseCard?(messageId: string): void;
 }
 
 export interface CardRendererOptions {
@@ -304,9 +306,8 @@ class CardHandleImpl implements CardHandle {
     // element-update/final-settings failures. One transient update also marks
     // that stream failed and suppresses every later snapshot. Therefore a
     // resolved stream promise alone is not proof that the final answer reached
-    // the message. Force one ordinary full-card update after the native stream
-    // settles; this also emits a fresh message-update event for clients whose
-    // typewriter renderer got stuck on an older snapshot.
+    // the card. The transport force-updates the exact CardKit entity referenced
+    // by this message (and only falls back to message patching for legacy cards).
     try {
       if (content.length <= STATIC_FINAL_CARD_MAX_CHARS) {
         await this.replaceFinalCardWithRetry(content);
@@ -341,6 +342,8 @@ class CardHandleImpl implements CardHandle {
         [nativeStreamError, replaceErr].filter((err) => err !== undefined),
         `card finalization failed for original message ${this.messageId}`,
       );
+    } finally {
+      this.outbound.releaseCard?.(this.messageId);
     }
   }
 
@@ -436,6 +439,7 @@ export class CardRenderer {
     } catch (err) {
       finishProducer();
       await streamDone.catch(() => undefined);
+      this.outbound.releaseCard?.(controller.messageId);
       throw err;
     }
     return new CardHandleImpl({
