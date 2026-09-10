@@ -90,4 +90,50 @@ describe("codex support", () => {
       ],
     ]);
   });
+
+  it("builds sandboxed codex commands for an unattended channel", () => {
+    const policy = { mode: "sandbox", sandbox: "workspace-write", approveForMe: true } as const;
+    expect(_buildCommand({ agentKind: "codex", prompt: "hi", codexExecutionPolicy: policy })).toEqual([
+      "codex",
+      [
+        "exec",
+        "--approve-for-me",
+        "--json",
+        "--skip-git-repo-check",
+        "hi",
+      ],
+    ]);
+    expect(
+      _buildCommand({
+        agentKind: "codex",
+        prompt: "again",
+        resumeSessionId: "thread_1",
+        codexExecutionPolicy: policy,
+      }),
+    ).toEqual([
+      "codex",
+      [
+        "exec",
+        "--approve-for-me",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "thread_1",
+        "again",
+      ],
+    ]);
+  });
+
+  it("uses an explicit sandbox only when automatic approval is disabled", () => {
+    expect(
+      _buildCommand({
+        agentKind: "codex",
+        prompt: "inspect",
+        codexExecutionPolicy: { mode: "sandbox", sandbox: "read-only", approveForMe: false },
+      }),
+    ).toEqual([
+      "codex",
+      ["exec", "--sandbox", "read-only", "--json", "--skip-git-repo-check", "inspect"],
+    ]);
+  });
 });

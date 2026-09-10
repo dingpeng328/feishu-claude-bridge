@@ -1,10 +1,22 @@
-# feishu-claude-bridge
+# Feishu / WeChat local-agent bridges
 
-> 飞书话题 ↔ 本地 Agent CLI 的薄通道(纯对话版)。在飞书群里 @ 机器人提问，bridge 把消息转给跑在你本机的 `claude` 或 `codex` CLI，再把回复实时渲染成飞书卡片贴回话题。
+> 两个相互隔离的本地 bridge：飞书话题可接 `claude` 或 `codex` CLI；微信 ClawBot 固定接本地 `codex` CLI。二者可以同时运行，每个进程只接收和回复自己的平台消息。
 
-基于飞书 Channel SDK 实现，只保留**对话**核心。
+飞书侧基于 Channel SDK；微信侧使用腾讯公开的 ClawBot iLink 协议。两个入口都只保留**对话**核心。
 
-## 工作原理
+## 双 bridge 隔离方式
+
+| | 飞书进程 | 微信进程 |
+|---|---|---|
+| 配置文件 | `.env` | `.env.wechat` |
+| 启动脚本 | `bin/start-feishu.sh`（兼容 `bin/start.sh`） | `bin/start-wechat.sh` |
+| npm 命令 | `npm run start:feishu` | `npm run start:wechat` |
+| 本地状态 | `~/.feishu-claude-bridge/` | `~/.wechat-codex-bridge/` |
+| 消息源 | 飞书 Channel WebSocket | 微信 ClawBot iLink 长轮询 |
+
+配置、PID 锁、日志、消息游标和 Codex 会话映射全部分开。停止或重启其中一个，不会停止另一个；两边只复用仓库里的 Agent runner 代码。
+
+## 飞书工作原理
 
 ```
 飞书群 @bot ──(飞书 Channel SDK WebSocket 长连)──► ChannelClient.events()
@@ -54,7 +66,7 @@ cd feishu-claude-bridge
 npm install                 # 安装官方 @larksuite/channel SDK
 cp .env.example .env        # 填 FEISHU_APP_ID / FEISHU_APP_SECRET
 npm run typecheck && npm test
-bash bin/start.sh           # 长驻;控制台应打印 connected as <bot名>
+bash bin/start-feishu.sh    # 长驻;控制台应打印 connected as <bot名>
 ```
 
 使用本地 Codex：
@@ -67,14 +79,46 @@ AGENT_BIN=codex
 Codex 模式会使用 `codex --dangerously-bypass-approvals-and-sandbox exec --json ...`，也就是完全放开沙箱和审批，方便访问网络和本机资源。请只把机器人放进可信群。
 
 > 后台运行 + 写日志:
-> `nohup bash bin/start.sh > ~/.feishu-claude-bridge/bridge.log 2>&1 &`
+> `nohup bash bin/start-feishu.sh >/dev/null 2>&1 &`
+
+## 微信 bridge 安装与运行
+
+微信侧采用 [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin) 公开的 ClawBot iLink 协议，首次启动通过微信扫码取得本机凭证，不需要填写飞书 App ID/Secret，也不会读取 `.env` 里的飞书配置。
+
+```bash
+cd feishu-claude-bridge
+npm install
+cp .env.wechat.example .env.wechat
+# 编辑 WECHAT_WORK_DIR，指向允许 Codex 工作的目录
+
+# 首次必须前台启动并扫码；以后会复用本机凭证
+bash bin/start-wechat.sh
+
+# 需要重新绑定时
+bash bin/start-wechat.sh --login
+```
+
+微信中可直接发文字或带文字转写的语音；`/new` 新建 Codex 会话，`/stop` 中止当前处理，`/status` 查看状态。每次进程重启会开启新的 Codex 会话边界，但消息消费游标会保留，用于避免重复处理。
+
+扫码成功后的凭证仅写入 `~/.wechat-codex-bridge/account.json`（权限 `0600`）；日志不会输出 bot token。微信 Codex 默认运行在 `workspace-write` 沙箱，并自动批准沙箱内操作；可在 `.env.wechat` 改成 `read-only`。删除、发布、推送和生产写入仍要求对话中明确确认。
+
+两个进程同时长驻：
+
+```bash
+nohup bash bin/start-feishu.sh >/dev/null 2>&1 &
+nohup bash bin/start-wechat.sh >/dev/null 2>&1 &
+```
+
+日志分别位于 `~/.feishu-claude-bridge/bridge.log` 和 `~/.wechat-codex-bridge/bridge.log`。
+
+> 进程和运行状态虽然隔离，但如果两份配置把 `WORK_DIR` / `WECHAT_WORK_DIR` 指向同一个 Git 工作区，两边同时改同一文件仍可能冲突。需要文件级完全隔离时，请给两个 bridge 配置不同的 Git worktree。
 
 ### ⚠️ macOS 必读:防睡眠(否则消息会延迟/收不到)
 
 macOS 的节能 / **App Nap** 会把空闲或后台的 node 进程挂起 → 飞书长连接(WS)心跳停 →
 被判定超时断开 → 重连慢(实测约 24s),消息卡在断开窗口、延迟几分钟甚至收不到。
 
-`bin/start.sh` 已用 **`caffeinate -is`** 包裹运行来防止这点(直接 `npm start` 不防睡眠,
+两个 `bin/start-*.sh` 都已用 **`caffeinate -is`** 包裹运行来防止这点(直接运行 npm 命令不防睡眠,
 **不要用它长跑**)。即便如此,**合盖 / 系统休眠仍会断**。
 
 **要真正稳定长期运行,把 bridge 放到一台常开、不休眠、网络稳定的机器(如 Linux 服务器)** ——
@@ -116,11 +160,29 @@ bridge 有三层丢消息保护：官方 SDK 负责底层 ping/pong，并以 15 
 
 这段提示词只负责角色和回答风格；`thread_id`、完整话题历史和当前消息仍由 bridge 自动拼接。配置修改后需重启 bridge，并从新的 Agent 会话开始生效。
 
+## 微信配置项（`.env.wechat`）
+
+| 变量 | 说明 |
+|---|---|
+| `WECHAT_WORK_DIR` | Codex 工作目录；默认 `~/.wechat-codex-bridge/work` |
+| `WECHAT_AGENT_BIN` | Codex CLI 路径；默认 `codex` |
+| `WECHAT_AGENT_SYSTEM_PROMPT` | 新微信 Codex 会话的系统提示词 |
+| `WECHAT_SUBPROCESS_TIMEOUT_MS` | 单轮超时；默认 30 分钟 |
+| `WECHAT_CODEX_SANDBOX` | `read-only` 或 `workspace-write`；默认后者 |
+| `WECHAT_CODEX_APPROVE_FOR_ME` | 是否让 Codex 自动审查并批准操作；仅适用于 `workspace-write`，默认 `true` |
+| `WECHAT_STATE_DIR` | 微信独立状态目录；默认 `~/.wechat-codex-bridge` |
+| `WECHAT_API_BASE_URL` | 登录后 API base URL 的后备值；通常不需要修改 |
+| `WECHAT_BOT_TYPE` | ClawBot 类型；默认 `3` |
+| `WECHAT_BOT_AGENT` | 协议客户端标识；默认 `WechatCodexBridge/0.1.0` |
+
+也可用 `WECHAT_ENV_FILE=/absolute/path/to/file` 指定另一份微信配置文件，适合在同一代码目录下管理不同运行环境。
+
 ## 项目结构
 
 ```
 src/
-├── main.ts                 入口 + 优雅退出
+├── main.ts                 飞书入口 + 优雅退出
+├── wechat-main.ts          微信独立入口 + 扫码登录 + 优雅退出
 ├── config.ts               .env 校验
 ├── lark/
 │   ├── transport.ts        LarkMessageEvent 类型 + AsyncQueue
@@ -131,6 +193,13 @@ src/
 │   ├── runner.ts           spawn claude/codex + NDJSON 解析
 │   ├── sessionStore.ts     threadId → sessionId 持久化
 │   └── prompt.ts           极简 prompt
-└── bridge/
+├── bridge/
     └── handler.ts          编排:per-thread 串行 + 并发信号量 + handleOne
+└── wechat/
+    ├── config.ts           .env.wechat 校验 + 独立路径
+    ├── auth.ts             ClawBot 扫码与凭证保存
+    ├── protocol.ts         iLink 协议客户端
+    ├── client.ts           长轮询、游标、去重、收发消息
+    ├── handler.ts          微信会话 → 本地 Codex
+    └── state.ts            微信凭证与消费状态
 ```

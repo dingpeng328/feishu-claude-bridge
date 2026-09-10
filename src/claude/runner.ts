@@ -17,6 +17,14 @@ import { createInterface } from "node:readline";
 
 export type AgentKind = "claude" | "codex";
 
+export type CodexExecutionPolicy =
+  | { mode: "dangerous-bypass" }
+  | {
+      mode: "sandbox";
+      sandbox: "read-only" | "workspace-write";
+      approveForMe?: boolean;
+    };
+
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
   | { type: "text_delta"; text: string; raw: unknown }
@@ -37,6 +45,8 @@ export interface RunOptions {
   /** @default 30 min */
   timeoutMs?: number;
   abortSignal?: AbortSignal;
+  /** Codex-only execution policy. Omitted preserves the legacy bypass behavior. */
+  codexExecutionPolicy?: CodexExecutionPolicy;
   /** @default depends on agentKind */
   agentBinPath?: string;
   /** @deprecated use agentBinPath */
@@ -85,10 +95,21 @@ function buildCommand(opts: RunOptions): [string, string[]] {
 
 function buildCodexCommand(opts: RunOptions): [string, string[]] {
   const bin = opts.agentBinPath ?? "codex";
-  const args: string[] = [
-    "--dangerously-bypass-approvals-and-sandbox",
-    "exec",
-  ];
+  const policy = opts.codexExecutionPolicy ?? { mode: "dangerous-bypass" };
+  const args: string[] = [];
+  if (policy.mode === "dangerous-bypass") {
+    // Keep the historical Feishu launch shape byte-for-byte compatible.
+    args.push("--dangerously-bypass-approvals-and-sandbox", "exec");
+  } else if (policy.approveForMe === true) {
+    // Codex defines --approve-for-me as its own workspace-write policy and
+    // rejects it when --sandbox is also present.
+    if (policy.sandbox !== "workspace-write") {
+      throw new Error("Codex --approve-for-me requires the workspace-write policy.");
+    }
+    args.push("exec", "--approve-for-me");
+  } else {
+    args.push("exec", "--sandbox", policy.sandbox);
+  }
   const execArgs = ["--json", "--skip-git-repo-check"];
   if (opts.resumeSessionId != null) {
     args.push("resume", ...execArgs, opts.resumeSessionId, opts.prompt);

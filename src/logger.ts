@@ -8,7 +8,10 @@ function redactSecrets(value: string): string {
   return value
     .replace(/(Authorization["']?\s*[:=]\s*["']?Bearer\s+)[^\s,"'}]+/gi, "$1<redacted>")
     .replace(/\bBearer\s+[^\s,"'}]+/gi, "Bearer <redacted>")
-    .replace(/((?:app[_-]?secret|access[_-]?token|cookie)["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi, "$1<redacted>");
+    .replace(
+      /((?:app[_-]?secret|access[_-]?token|bot[_-]?token|context[_-]?token|cookie)["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi,
+      "$1<redacted>",
+    );
 }
 
 /** Mirror timestamped console output into a durable append-only runtime log. */
