@@ -28,8 +28,8 @@ export type CodexExecutionPolicy =
 export type AgentStreamEvent =
   | { type: "system_init"; sessionId: string; raw: unknown }
   | { type: "text_delta"; text: string; raw: unknown }
-  | { type: "tool_use"; toolName: string; toolInput: unknown; raw: unknown }
-  | { type: "tool_result"; raw: unknown }
+  | { type: "tool_started"; callId?: string; toolName: string; raw: unknown }
+  | { type: "tool_finished"; callId?: string; toolName?: string; isError: boolean; raw: unknown }
   | { type: "result"; stopReason: string; raw: unknown }
   | { type: "raw"; raw: unknown };
 
@@ -55,7 +55,7 @@ export interface RunOptions {
 
 export interface RunHandle {
   events: AsyncIterable<AgentStreamEvent>;
-  done: Promise<{ exitCode: number; sessionId?: string }>;
+  done: Promise<{ exitCode: number; sessionId?: string; termination?: "timeout" | "interrupted" }>;
   kill(): void;
 }
 
@@ -172,9 +172,9 @@ function* parseClaudeObject(obj: unknown): Generator<AgentStreamEvent> {
           emitted = true;
         } else if (block["type"] === "tool_use") {
           yield {
-            type: "tool_use",
+            type: "tool_started",
+            ...(typeof block["id"] === "string" ? { callId: block["id"] } : {}),
             toolName: typeof block["name"] === "string" ? block["name"] : "unknown",
-            toolInput: block["input"] ?? null,
             raw: obj,
           };
           emitted = true;
@@ -194,13 +194,21 @@ function* parseClaudeObject(obj: unknown): Generator<AgentStreamEvent> {
       Array.isArray((message as Record<string, unknown>)["content"])
     ) {
       const content = (message as Record<string, unknown>)["content"] as unknown[];
+      let emitted = false;
       for (const item of content) {
         if (typeof item !== "object" || item === null) continue;
-        if ((item as Record<string, unknown>)["type"] === "tool_result") {
-          yield { type: "tool_result", raw: obj };
-          return;
+        const block = item as Record<string, unknown>;
+        if (block["type"] === "tool_result") {
+          yield {
+            type: "tool_finished",
+            ...(typeof block["tool_use_id"] === "string" ? { callId: block["tool_use_id"] } : {}),
+            isError: block["is_error"] === true,
+            raw: obj,
+          };
+          emitted = true;
         }
       }
+      if (emitted) return;
     }
     yield { type: "raw", raw: obj };
     return;
@@ -240,17 +248,40 @@ function* parseCodexObject(obj: unknown): Generator<AgentStreamEvent> {
     yield { type: "text_delta", text: itemRecord["text"], raw: obj };
     return;
   }
-  if (eventType === "item.started" || eventType === "item.completed") {
+  if (
+    (eventType === "item.started" || eventType === "item.completed") &&
+    itemType !== "agent_message" &&
+    itemType !== "message" &&
+    itemType !== "reasoning" &&
+    itemType !== "plan" &&
+    itemType !== "todo_list"
+  ) {
     const toolName =
-      typeof itemType === "string" && itemType.length > 0
-        ? itemType
+      typeof itemRecord["tool"] === "string"
+        ? itemRecord["tool"]
         : typeof itemRecord["name"] === "string"
           ? itemRecord["name"]
-          : "tool";
-    if (toolName !== "agent_message" && toolName !== "message") {
-      yield { type: "tool_use", toolName, toolInput: item, raw: obj };
-      return;
+          : typeof itemType === "string" && itemType.length > 0
+            ? itemType
+            : "tool";
+    const callId = typeof itemRecord["id"] === "string" ? itemRecord["id"] : undefined;
+    if (eventType === "item.started") {
+      yield { type: "tool_started", ...(callId ? { callId } : {}), toolName, raw: obj };
+    } else {
+      const status = itemRecord["status"];
+      yield {
+        type: "tool_finished",
+        ...(callId ? { callId } : {}),
+        toolName,
+        isError:
+          itemRecord["error"] != null ||
+          status === "failed" ||
+          status === "error" ||
+          (typeof itemRecord["exit_code"] === "number" && itemRecord["exit_code"] !== 0),
+        raw: obj,
+      };
     }
+    return;
   }
   yield { type: "raw", raw: obj };
 }
@@ -263,11 +294,28 @@ export function runAgent(opts: RunOptions): RunHandle {
 
   const child = spawn(bin, args, {
     env,
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
     ...(opts.cwd != null ? { cwd: opts.cwd } : {}),
   });
 
   let discoveredSessionId: string | undefined;
+  let processExited = false;
+  let termination: "timeout" | "interrupted" | undefined;
+  const groupAlive = (): boolean => {
+    if (process.platform === "win32" || !child.pid) return !processExited;
+    try { process.kill(-child.pid, 0); return true; } catch { return false; }
+  };
+  const signalProcess = (signal: NodeJS.Signals): void => {
+    try {
+      if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+      else if (!processExited) child.kill(signal);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+        console.warn(`[runner] could not send ${signal}:`, (err as Error).message);
+      }
+    }
+  };
 
   // ── kill helper (SIGTERM → grace → SIGKILL → force-settle) ────────────────
   // forceSettle is wired up below once the `done` promise's resolver exists; it
@@ -275,18 +323,23 @@ export function runAgent(opts: RunOptions): RunHandle {
   // is never delivered (lost SIGCHLD after sleep, wedged grandchild stdio).
   let forceSettle: ((exitCode: number) => void) | undefined;
   let killScheduled = false;
+  let terminationEscalated = false;
+  let pendingExitCode: number | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let postKillTimer: ReturnType<typeof setTimeout> | undefined;
   function doKill(): void {
     if (killScheduled) return;
     killScheduled = true;
-    child.kill("SIGTERM");
+    termination ??= "interrupted";
+    signalProcess("SIGTERM");
     killTimer = setTimeout(() => {
-      if (!child.killed) child.kill("SIGKILL");
+      terminationEscalated = true;
+      if (groupAlive()) signalProcess("SIGKILL");
       // Last resort: the process should be gone now. If 'close'/'exit' still
       // don't fire shortly, settle `done` ourselves so the turn can't wedge.
       postKillTimer = setTimeout(() => forceSettle?.(137), POST_KILL_FORCE_MS);
       postKillTimer.unref();
+      if (pendingExitCode !== undefined) forceSettle?.(pendingExitCode);
     }, SIGKILL_GRACE_MS);
     killTimer.unref();
   }
@@ -308,7 +361,7 @@ export function runAgent(opts: RunOptions): RunHandle {
     grandchildGraceTimer.unref();
   }
 
-  const timeoutHandle = setTimeout(doKill, timeoutMs);
+  const timeoutHandle = setTimeout(() => { termination = "timeout"; doKill(); }, timeoutMs);
   timeoutHandle.unref();
 
   if (opts.abortSignal != null) {
@@ -323,22 +376,29 @@ export function runAgent(opts: RunOptions): RunHandle {
   // when child.stdout hasn't drained (grandchild holding the pipe).
   const rlAbortController = new AbortController();
 
-  const done = new Promise<{ exitCode: number; sessionId?: string }>((resolve, reject) => {
+  const done = new Promise<{ exitCode: number; sessionId?: string; termination?: "timeout" | "interrupted" }>((resolve, reject) => {
     let settled = false;
     const finalizeResolve = (exitCode: number): void => {
       if (settled) return;
+      if (killScheduled && !terminationEscalated && groupAlive()) {
+        pendingExitCode = exitCode;
+        return;
+      }
       settled = true;
       clearTimeout(timeoutHandle);
+      // A parent exiting doesn't prove its tool subprocesses exited. Keep the
+      // escalation timer alive until the owned process group has disappeared.
       clearTimeout(killTimer);
       clearTimeout(postKillTimer);
       clearTimeout(grandchildGraceTimer);
       rlAbortController.abort();
+      opts.abortSignal?.removeEventListener("abort", doKill);
       if (exitCode !== 0 && !killScheduled) {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
         reject(new Error(`${agentKind} exited with code ${exitCode}` + (stderr ? `\nstderr: ${stderr}` : "")));
         return;
       }
-      resolve({ exitCode, sessionId: discoveredSessionId });
+      resolve({ exitCode, sessionId: discoveredSessionId, ...(termination ? { termination } : {}) });
     };
     // Let doKill force-settle `done` once the child is (presumed) dead but the
     // OS never delivered its exit/close — guarded by `settled`, so harmless if
@@ -352,6 +412,8 @@ export function runAgent(opts: RunOptions): RunHandle {
       clearTimeout(killTimer);
       clearTimeout(postKillTimer);
       rlAbortController.abort();
+      clearTimeout(grandchildGraceTimer);
+      opts.abortSignal?.removeEventListener("abort", doKill);
       if (err.code === "ENOENT") {
         reject(
           new Error(
@@ -369,6 +431,7 @@ export function runAgent(opts: RunOptions): RunHandle {
     // Fallback: 'exit' fired (process gone) but 'close' (stdio drained) didn't
     // within 5s — grandchild holding stdio. Force-resolve so the handler can finalize.
     child.on("exit", (code: number | null) => {
+      processExited = true;
       if (settled) return;
       const t = setTimeout(() => {
         if (settled) return;
@@ -381,6 +444,9 @@ export function runAgent(opts: RunOptions): RunHandle {
       t.unref();
     });
   });
+  // The consumer drains events before awaiting done; an early process error
+  // must not become an unhandled rejection in that interval.
+  void done.catch(() => undefined);
 
   async function* generateEvents(): AsyncGenerator<AgentStreamEvent> {
     const rl = createInterface({

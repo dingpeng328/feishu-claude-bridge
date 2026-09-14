@@ -1,21 +1,25 @@
 /**
- * Renders one agent turn through the official Channel SDK's native CardKit
- * markdown stream. The SDK owns CardKit entities, throttling, and rollover for
- * long replies; this module only maintains the current answer snapshot.
+ * Renders one agent turn through a managed CardKit stream. Tool activity and
+ * answer text use separate elements so mutable status never invalidates the
+ * answer element's append-only typewriter buffer.
  */
 
 import type { AgentStreamEvent } from "../claude/runner.js";
+import { BODY_ELEMENT_ID, STATUS_ELEMENT_ID } from "./cardStream.js";
 
 export interface MarkdownStreamController {
   readonly messageId: string;
+  setStatus(fullContent: string): Promise<void>;
   setContent(fullContent: string): Promise<void>;
+  /** Authoritative final text; transport commits and verifies every segment. */
+  setFinalContent?(status: string, body: string): void;
 }
 
 export interface OutboundCardClient {
   streamMarkdown(
     chatId: string,
     replyToMessageId: string,
-    opts: { replyInThread: boolean },
+    opts: { replyInThread: boolean; initialStatus: string },
     producer: (controller: MarkdownStreamController) => Promise<void>,
   ): Promise<{ messageId: string }>;
   /** Force-replace the streamed message with an ordinary, non-streaming card. */
@@ -39,12 +43,15 @@ export interface CardHandle {
   messageId: string;
   /** Accumulate a stream event. Live update failures are logged and retried by the next snapshot. */
   handle(event: AgentStreamEvent): void;
-  /** Finish the native stream and wait until CardKit has committed the final content. */
+  setPhase?(phase: string): void;
+  /** Finish the managed stream and wait until CardKit has committed the final content. */
   finalize(opts: {
     finalText?: string;
     success: boolean;
     failureReason?: string;
     interrupted?: boolean;
+    interruptionReason?: "shutdown" | "resolved";
+    timedOut?: boolean;
   }): Promise<void>;
 }
 
@@ -54,6 +61,7 @@ const PROCESSING_STATUS = "> ⏳ **正在处理**";
 const SUCCESS_STATUS = "> ✅ **回复完成**";
 export const INITIAL_STREAM_TEXT = `${PROCESSING_STATUS}\n> Agent 正在思考或执行任务...`;
 const STATIC_FINAL_CARD_MAX_CHARS = 29_000;
+const LIVE_UPDATE_THROTTLE_MS = 100;
 const FINAL_REPLACE_ATTEMPTS = 3;
 const FINAL_RETRY_BASE_DELAY_MS = 300;
 const FINAL_VERIFY_ATTEMPTS = 3;
@@ -75,7 +83,8 @@ function truncateSummary(text: string, max = 50): string {
   return cleaned.length <= max ? cleaned : `${cleaned.slice(0, max - 1)}…`;
 }
 
-function staticFinalCard(markdown: string): object {
+function staticFinalCard(status: string, body: string): object {
+  const markdown = body ? `${status}\n\n${body}` : status;
   return {
     schema: "2.0",
     config: {
@@ -83,7 +92,10 @@ function staticFinalCard(markdown: string): object {
       summary: { content: truncateSummary(markdown) },
     },
     body: {
-      elements: [{ tag: "markdown", element_id: "stream_md", content: markdown }],
+      elements: [
+        { tag: "markdown", element_id: STATUS_ELEMENT_ID, content: status },
+        { tag: "markdown", element_id: BODY_ELEMENT_ID, content: body || "\u200b" },
+      ],
     },
   };
 }
@@ -121,18 +133,57 @@ function optimizeMarkdownStyle(text: string): string {
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function progressText(toolName: string): string {
-  const name = toolName.toLowerCase();
-  if (/(read|search|find|fetch|web)/.test(name)) return "正在查找资料...";
-  if (/(write|edit|patch)/.test(name)) return "正在整理结果...";
-  if (/(bash|exec|command|shell|test)/.test(name)) return "正在执行检查...";
-  return "正在处理...";
+function toolDisplayName(toolName: string): string {
+  const searchable = toolName.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+  if (/\b(?:web search|websearch|search query)\b/.test(searchable)) return "网页搜索";
+  if (/\b(?:read|search|find|fetch|open)\b/.test(searchable)) return "查找资料";
+  if (/\b(?:write|edit|patch|file change)\b/.test(searchable)) return "修改文件";
+  if (/\b(?:bash|exec|command|shell|test)\b/.test(searchable)) return "执行命令";
+
+  const cleaned = toolName
+    .replace(/^mcp__/, "")
+    .replace(/__/g, ".")
+    .replace(/_+/g, " ")
+    .replace(/[*_`[\]<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return truncateSummary(cleaned || "工具", 32);
 }
 
-function liveMarkdown(bodyText: string, progress?: string): string {
-  const body = optimizeMarkdownStyle(bodyText);
-  if (body) return `${PROCESSING_STATUS}\n\n${body}`;
-  return progress ? `${PROCESSING_STATUS}\n> ${progress}` : INITIAL_STREAM_TEXT;
+interface ToolActivitySnapshot {
+  startedCount: number;
+  completedCount: number;
+  activeNames: string[];
+}
+
+function summarizeActiveTools(toolNames: string[]): string {
+  const counts = new Map<string, number>();
+  for (const name of toolNames) counts.set(name, (counts.get(name) ?? 0) + 1);
+  const entries = [...counts.entries()];
+  const visible = entries.slice(0, 2).map(([name, count]) => (count > 1 ? `${name} ×${count}` : name));
+  const hiddenCount = entries.slice(2).reduce((sum, [, count]) => sum + count, 0);
+  return hiddenCount > 0 ? `${visible.join("、")}，另有 ${hiddenCount} 个` : visible.join("、");
+}
+
+function renderActivity(activity: ToolActivitySnapshot): string[] {
+  if (activity.startedCount === 0) return [];
+  const activeCount = activity.activeNames.length;
+  const lines = [
+    `> 🔧 已调用 ${activity.startedCount} 次 · 已完成 ${activity.completedCount} 次 · 进行中 ${activeCount}`,
+  ];
+  lines.push(
+    activeCount > 0
+      ? `> 正在调用：${summarizeActiveTools(activity.activeNames)}`
+      : "> 正在整理结果...",
+  );
+  return lines;
+}
+
+function liveStatusMarkdown(activity?: ToolActivitySnapshot): string {
+  const activityLines = activity ? renderActivity(activity) : [];
+  return activityLines.length > 0
+    ? [PROCESSING_STATUS, ...activityLines].join("\n")
+    : INITIAL_STREAM_TEXT;
 }
 
 function formatDuration(elapsedMs: number): string {
@@ -150,30 +201,72 @@ function formatDuration(elapsedMs: number): string {
   return parts.join(" ");
 }
 
-function terminalMarkdown(opts: {
+interface TerminalContent {
+  status: string;
+  body: string;
+  markdown: string;
+}
+
+function terminalContent(opts: {
   bodyText: string;
   success: boolean;
   interrupted?: boolean;
   elapsedMs: number;
-}): string {
+  toolCount?: number;
+  interruptionReason?: "shutdown" | "resolved";
+  timedOut?: boolean;
+}): TerminalContent {
   const body = optimizeMarkdownStyle(opts.bodyText);
   const duration = `> ⏱️ 处理耗时：${formatDuration(opts.elapsedMs)}`;
-  if (opts.interrupted) {
-    const status = `> ⏸️ ${INTERRUPTED_MARKER}\n${duration}\n> 正在按新消息继续处理。`;
-    return body ? `${status}\n\n${body}` : status;
+  const toolSummary = opts.toolCount ? `\n> 🔧 共调用 ${opts.toolCount} 次工具` : "";
+  let status: string;
+  let finalBody = body;
+  if (opts.interrupted && opts.interruptionReason) {
+    status = `> ⏸️ **处理已中断**${toolSummary}\n${duration}\n> ${opts.interruptionReason === "shutdown" ? "服务正在停止，请重新 @ 我继续。" : "本话题已结束。"}`;
+  } else if (opts.interrupted) {
+    status = `> ⏸️ ${INTERRUPTED_MARKER}${toolSummary}\n${duration}\n> 正在按新消息继续处理。`;
+  } else if (!opts.success) {
+    status = `> ❌ ${FAILURE_MARKER}${toolSummary}\n${duration}\n> ${opts.timedOut ? "本轮处理超时，请缩小任务范围后重试。" : "请稍后重试，详细原因已写入服务日志。"}`;
+  } else {
+    status = `${SUCCESS_STATUS}${toolSummary}\n${duration}`;
+    finalBody ||= "本轮没有拿到 agent 的回复，请再 @ 我一次重试。";
   }
-  if (!opts.success) {
-    const status = `> ❌ ${FAILURE_MARKER}\n${duration}\n> 请稍后重试，详细原因已写入服务日志。`;
-    return body ? `${status}\n\n${body}` : status;
-  }
-  const answer = body || "本轮没有拿到 agent 的回复，请再 @ 我一次重试。";
-  return `${SUCCESS_STATUS}\n${duration}\n\n${answer}`;
+  return {
+    status,
+    body: finalBody,
+    markdown: finalBody ? `${status}\n\n${finalBody}` : status,
+  };
+}
+
+function terminalMarkdown(opts: Parameters<typeof terminalContent>[0]): string {
+  return terminalContent(opts).markdown;
 }
 
 interface RenderState {
   textBuffer: string;
   /** Raw message id of the currently accumulating assistant turn. */
   currentRawMsgId: string | null;
+  currentTurnStart: number;
+  toolCallCount: number;
+  completedToolCount: number;
+  anonymousCallSequence: number;
+  startedCallIds: Set<string>;
+  finishedCallIds: Set<string>;
+  activeTools: Map<string, string>;
+}
+
+function createRenderState(): RenderState {
+  return {
+    textBuffer: "",
+    currentRawMsgId: null,
+    currentTurnStart: 0,
+    toolCallCount: 0,
+    completedToolCount: 0,
+    anonymousCallSequence: 0,
+    startedCallIds: new Set(),
+    finishedCallIds: new Set(),
+    activeTools: new Map(),
+  };
 }
 
 function extractRawMessageId(raw: unknown): string | null {
@@ -203,7 +296,14 @@ class CardHandleImpl implements CardHandle {
   private finalized = false;
   private finalizePromise: Promise<void> | undefined;
   private updateTail: Promise<void> = Promise.resolve();
-  private state: RenderState = { textBuffer: "", currentRawMsgId: null };
+  private pendingLiveStatus: string | undefined;
+  private pendingLiveBody: string | undefined;
+  private drainingLiveUpdates = false;
+  private lastLiveUpdateAtMs: number | undefined;
+  private state: RenderState = createRenderState();
+  private phase = "Agent 正在思考或执行任务";
+  private lastActivityAtMs: number | undefined;
+  private readonly heartbeat: ReturnType<typeof setInterval>;
 
   constructor(opts: {
     controller: MarkdownStreamController;
@@ -222,20 +322,28 @@ class CardHandleImpl implements CardHandle {
     this.startedAtMs = opts.startedAtMs;
     this.now = opts.now;
     this.sleep = opts.sleep;
+    this.heartbeat = setInterval(() => this.queueStatusSnapshot(true), 15_000);
+    this.heartbeat.unref();
+  }
+
+  setPhase(phase: string): void {
+    this.phase = phase;
+    this.queueStatusSnapshot(true);
   }
 
   handle(event: AgentStreamEvent): void {
     if (this.finalized) return;
+    this.lastActivityAtMs = this.now();
     if (event.type === "text_delta") {
       this.accumulateText(event);
-      this.queueLiveUpdate(liveMarkdown(this.state.textBuffer));
+      this.queueBodySnapshot();
       return;
     }
-    // A compact, non-sensitive status is useful before the first answer token.
-    // Once text exists, tool activity stays out of the answer card.
-    if (event.type === "tool_use" && !this.state.textBuffer) {
-      this.queueLiveUpdate(liveMarkdown("", progressText(event.toolName)));
+    if (event.type === "tool_started") {
+      if (this.startTool(event.callId, event.toolName)) this.queueStatusSnapshot();
+      return;
     }
+    if (event.type === "tool_finished" && this.finishTool(event.callId)) this.queueStatusSnapshot();
   }
 
   finalize(opts: {
@@ -243,9 +351,12 @@ class CardHandleImpl implements CardHandle {
     success: boolean;
     failureReason?: string;
     interrupted?: boolean;
+    interruptionReason?: "shutdown" | "resolved";
+    timedOut?: boolean;
   }): Promise<void> {
     if (this.finalizePromise) return this.finalizePromise;
     this.finalized = true;
+    clearInterval(this.heartbeat);
     this.finalizePromise = this.finish(opts);
     return this.finalizePromise;
   }
@@ -254,63 +365,194 @@ class CardHandleImpl implements CardHandle {
     const rawMsgId = extractRawMessageId(event.raw);
     if (rawMsgId !== null && rawMsgId !== this.state.currentRawMsgId) {
       if (this.state.textBuffer.length > 0) this.state.textBuffer += "\n\n";
+      this.state.currentTurnStart = this.state.textBuffer.length;
       this.state.currentRawMsgId = rawMsgId;
       this.state.textBuffer += event.text;
       return;
     }
 
     if (this.state.currentRawMsgId === null) this.state.currentRawMsgId = rawMsgId;
-    const lastSeparator = this.state.textBuffer.lastIndexOf("\n\n");
-    const currentTurnStart = lastSeparator === -1 ? 0 : lastSeparator + 2;
-    this.state.textBuffer = this.state.textBuffer.slice(0, currentTurnStart) + event.text;
+    this.state.textBuffer = this.state.textBuffer.slice(0, this.state.currentTurnStart) + event.text;
   }
 
-  private queueLiveUpdate(content: string): void {
-    if (!content) return;
+  private startTool(callId: string | undefined, rawToolName: string): boolean {
+    const callKey = callId ?? `anonymous-${++this.state.anonymousCallSequence}`;
+    if (this.state.startedCallIds.has(callKey) || this.state.finishedCallIds.has(callKey)) {
+      return false;
+    }
+    this.state.startedCallIds.add(callKey);
+    this.state.activeTools.set(callKey, toolDisplayName(rawToolName));
+    this.state.toolCallCount++;
+    return true;
+  }
+
+  private finishTool(callId: string | undefined): boolean {
+    let callKey = callId;
+    if (callKey && this.state.finishedCallIds.has(callKey)) return false;
+
+    if (!callKey) callKey = this.state.activeTools.keys().next().value as string | undefined;
+    if (!callKey) callKey = `anonymous-${++this.state.anonymousCallSequence}`;
+    if (this.state.finishedCallIds.has(callKey)) return false;
+
+    // Some Codex item types only emit item.completed. Count those once so the
+    // final total still reflects every observed tool call.
+    if (!this.state.startedCallIds.has(callKey)) {
+      this.state.startedCallIds.add(callKey);
+      this.state.toolCallCount++;
+    }
+    this.state.finishedCallIds.add(callKey);
+    this.state.activeTools.delete(callKey);
+    this.state.completedToolCount++;
+    return true;
+  }
+
+  private queueStatusSnapshot(showTiming = false): void {
+    if (this.finalized) return;
+    this.queueLiveUpdate({
+      status: liveStatusMarkdown({
+        startedCount: this.state.toolCallCount,
+        completedCount: this.state.completedToolCount,
+        activeNames: [...this.state.activeTools.values()],
+      }) + (showTiming ? `\n> ${this.phase} · 已用时 ${formatDuration(this.now() - this.startedAtMs)}\n> ${this.lastActivityAtMs === undefined ? "尚未收到 Agent 输出" : `最近收到 Agent 活动：${formatDuration(this.now() - this.lastActivityAtMs)}前`}` : ""),
+    });
+  }
+
+  private queueBodySnapshot(): void {
+    const body = optimizeMarkdownStyle(this.state.textBuffer);
+    if (body) this.queueLiveUpdate({ body });
+  }
+
+  private queueLiveUpdate(update: { status?: string; body?: string }): void {
+    if (update.status !== undefined) this.pendingLiveStatus = update.status;
+    if (update.body !== undefined) this.pendingLiveBody = update.body;
+    if (this.drainingLiveUpdates) return;
+
+    // Keep only the newest snapshot while a CardKit update is in flight. This
+    // prevents fast/parallel events from building a visibly stale queue while
+    // keeping status and append-only answer content completely independent.
+    this.drainingLiveUpdates = true;
     this.updateTail = this.updateTail
       .catch(() => undefined)
-      .then(() => this.controller.setContent(content));
-    void this.updateTail.catch((err) => console.error("[card] native stream update failed:", err));
+      .then(async () => {
+        while (this.pendingLiveStatus !== undefined || this.pendingLiveBody !== undefined) {
+          const nextStatus = this.pendingLiveStatus;
+          const nextBody = this.pendingLiveBody;
+          this.pendingLiveStatus = undefined;
+          this.pendingLiveBody = undefined;
+          if (this.lastLiveUpdateAtMs !== undefined) {
+            const remainingMs = LIVE_UPDATE_THROTTLE_MS - (this.now() - this.lastLiveUpdateAtMs);
+            if (remainingMs > 0) await this.sleep(remainingMs);
+          }
+          if (nextStatus !== undefined) {
+            try {
+              await this.controller.setStatus(nextStatus);
+            } catch (err) {
+              console.error("[card] status element update failed:", err);
+            }
+          }
+          if (nextBody !== undefined) {
+            try {
+              await this.controller.setContent(nextBody);
+            } catch (err) {
+              console.error("[card] answer element update failed:", err);
+            }
+          }
+          this.lastLiveUpdateAtMs = this.now();
+        }
+      })
+      .finally(() => {
+        this.drainingLiveUpdates = false;
+        // An event can land after the drain loop observes an empty queue but
+        // before this finally callback runs. Re-arm the drain so that narrow
+        // microtask boundary cannot strand the newest snapshot.
+        if (this.pendingLiveStatus !== undefined || this.pendingLiveBody !== undefined) {
+          this.queueLiveUpdate({});
+        }
+      });
+  }
+
+  private async flushLiveUpdates(): Promise<void> {
+    while (
+      this.drainingLiveUpdates
+      || this.pendingLiveStatus !== undefined
+      || this.pendingLiveBody !== undefined
+    ) {
+      const tail = this.updateTail;
+      await tail.catch(() => undefined);
+      if (
+        tail === this.updateTail
+        && !this.drainingLiveUpdates
+        && this.pendingLiveStatus === undefined
+        && this.pendingLiveBody === undefined
+      ) {
+        return;
+      }
+    }
   }
 
   private async finish(opts: {
     finalText?: string;
     success: boolean;
     interrupted?: boolean;
+    interruptionReason?: "shutdown" | "resolved";
+    timedOut?: boolean;
   }): Promise<void> {
-    const content = terminalMarkdown({
+    const terminal = terminalContent({
       bodyText: opts.finalText ?? this.state.textBuffer,
       success: opts.success,
       interrupted: opts.interrupted,
       elapsedMs: Math.max(0, this.now() - this.startedAtMs),
+      toolCount: this.state.toolCallCount,
+      interruptionReason: opts.interruptionReason,
+      timedOut: opts.timedOut,
     });
+    const content = terminal.markdown;
 
-    let nativeStreamError: unknown;
-    try {
-      await this.updateTail.catch(() => undefined);
-      await this.controller.setContent(content);
-    } catch (err) {
-      nativeStreamError = err;
-    } finally {
-      // The SDK finalizes CardKit only after the producer settles.
+    await this.flushLiveUpdates();
+    if (this.controller.setFinalContent) {
+      this.controller.setFinalContent(terminal.status, terminal.body);
       this.finishProducer();
+      try {
+        await this.streamDone;
+        console.log(`[card] all final segments verified message_id=${this.messageId}`);
+      } finally {
+        this.outbound.releaseCard?.(this.messageId);
+      }
+      return;
     }
+    const terminalUpdateErrors: unknown[] = [];
+    try {
+      await this.controller.setStatus(terminal.status);
+    } catch (err) {
+      terminalUpdateErrors.push(err);
+    }
+    try {
+      await this.controller.setContent(terminal.body);
+    } catch (err) {
+      terminalUpdateErrors.push(err);
+    }
+    let streamError: unknown = terminalUpdateErrors.length > 0
+      ? new AggregateError(terminalUpdateErrors, "failed to update terminal CardKit elements")
+      : undefined;
+
+    // The channel adapter finalizes every managed CardKit segment only after
+    // the producer settles.
+    this.finishProducer();
 
     try {
       await this.streamDone;
     } catch (err) {
-      nativeStreamError ??= err;
+      streamError ??= err;
     }
 
-    // @larksuite/channel's native markdown stream intentionally swallows
-    // element-update/final-settings failures. One transient update also marks
-    // that stream failed and suppresses every later snapshot. Therefore a
-    // resolved stream promise alone is not proof that the final answer reached
-    // the card. The transport force-updates the exact CardKit entity referenced
-    // by this message (and only falls back to message patching for legacy cards).
+    // Live element failures are logged so generation can continue, and the
+    // managed stream can still fail while closing its segments. Therefore the
+    // producer settling is not proof that the terminal answer reached Feishu.
+    // Force-update the exact CardKit entity referenced by this message (and
+    // only fall back to message patching for legacy cards), then read it back.
     try {
       if (content.length <= STATIC_FINAL_CARD_MAX_CHARS) {
-        await this.replaceFinalCardWithRetry(content);
+        await this.replaceFinalCardWithRetry(terminal.status, terminal.body);
       }
       let verified = await this.verifyFinalMarkdown(content);
       // A successful CardKit update can become visible slightly before the
@@ -321,15 +563,15 @@ class CardHandleImpl implements CardHandle {
         console.warn(
           `[card] final card readback lagged; refreshing original message_id=${this.messageId}`,
         );
-        await this.replaceFinalCardWithRetry(content);
+        await this.replaceFinalCardWithRetry(terminal.status, terminal.body);
         verified = await this.verifyFinalMarkdown(content);
       }
       if (!verified) {
         throw new Error(`final card readback did not match message_id=${this.messageId}`);
       }
-      if (nativeStreamError !== undefined) {
+      if (streamError !== undefined) {
         console.warn(
-          `[card] native stream finalization failed but static final card recovered message_id=${this.messageId}: ${conciseError(nativeStreamError)}`,
+          `[card] managed stream finalization failed but static final card recovered message_id=${this.messageId}: ${conciseError(streamError)}`,
         );
       }
       console.log(`[card] final card verified message_id=${this.messageId}`);
@@ -339,7 +581,7 @@ class CardHandleImpl implements CardHandle {
         `[card] final card commit not confirmed message_id=${this.messageId}: ${conciseError(replaceErr)}`,
       );
       throw new AggregateError(
-        [nativeStreamError, replaceErr].filter((err) => err !== undefined),
+        [streamError, replaceErr].filter((err) => err !== undefined),
         `card finalization failed for original message ${this.messageId}`,
       );
     } finally {
@@ -347,11 +589,11 @@ class CardHandleImpl implements CardHandle {
     }
   }
 
-  private async replaceFinalCardWithRetry(content: string): Promise<void> {
+  private async replaceFinalCardWithRetry(status: string, body: string): Promise<void> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= FINAL_REPLACE_ATTEMPTS; attempt++) {
       try {
-        await this.outbound.replaceCard(this.messageId, staticFinalCard(content));
+        await this.outbound.replaceCard(this.messageId, staticFinalCard(status, body));
         return;
       } catch (err) {
         lastError = err;
@@ -421,7 +663,7 @@ export class CardRenderer {
     const streamDone = this.outbound.streamMarkdown(
       chatId,
       replyToMessageId,
-      { replyInThread: opts?.replyInThread ?? true },
+      { replyInThread: opts?.replyInThread ?? true, initialStatus: INITIAL_STREAM_TEXT },
       async (controller) => {
         markReady(controller);
         await producerLifetime;
@@ -431,17 +673,6 @@ export class CardRenderer {
     void streamDone.catch(markStartFailed);
 
     const controller = await ready;
-    // CardKit already receives this text in the initial card spec. Push it once
-    // more through the element-content API so clients that defer rendering a
-    // referenced streaming card show the status before the first agent token.
-    try {
-      await controller.setContent(INITIAL_STREAM_TEXT);
-    } catch (err) {
-      finishProducer();
-      await streamDone.catch(() => undefined);
-      this.outbound.releaseCard?.(controller.messageId);
-      throw err;
-    }
     return new CardHandleImpl({
       controller,
       finishProducer,
@@ -458,7 +689,7 @@ export class CardRenderer {
 export {
   FAILURE_MARKER as _FAILURE_MARKER,
   INTERRUPTED_MARKER as _INTERRUPTED_MARKER,
-  liveMarkdown as _liveMarkdown,
+  liveStatusMarkdown as _liveStatusMarkdown,
   formatDuration as _formatDuration,
   optimizeMarkdownStyle as _optimizeMarkdownStyle,
   terminalMarkdown as _terminalMarkdown,

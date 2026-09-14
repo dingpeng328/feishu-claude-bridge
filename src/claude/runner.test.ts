@@ -8,14 +8,25 @@ describe("_parseLinesMulti", () => {
     expect(events).toEqual([{ type: "system_init", sessionId: "sess_42", raw: expect.anything() }]);
   });
 
-  it("parses assistant text + tool_use blocks", () => {
+  it("parses assistant text + tool start blocks without exposing tool input", () => {
     const line = JSON.stringify({
       type: "assistant",
-      message: { id: "msg_1", content: [{ type: "text", text: "hi" }, { type: "tool_use", name: "Bash", input: { command: "ls" } }] },
+      message: {
+        id: "msg_1",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "tool_use", id: "tool_1", name: "Bash", input: { command: "ls" } },
+        ],
+      },
     });
     const events = [..._parseLinesMulti(line)];
     expect(events[0]).toMatchObject({ type: "text_delta", text: "hi" });
-    expect(events[1]).toMatchObject({ type: "tool_use", toolName: "Bash", toolInput: { command: "ls" } });
+    expect(events[1]).toMatchObject({
+      type: "tool_started",
+      callId: "tool_1",
+      toolName: "Bash",
+    });
+    expect(events[1]).not.toHaveProperty("toolInput");
   });
 
   it("parses result with stop_reason", () => {
@@ -23,9 +34,29 @@ describe("_parseLinesMulti", () => {
     expect([..._parseLinesMulti(line)][0]).toMatchObject({ type: "result", stopReason: "end_turn" });
   });
 
-  it("parses user tool_result", () => {
-    const line = JSON.stringify({ type: "user", message: { content: [{ type: "tool_result" }] } });
-    expect([..._parseLinesMulti(line)][0]).toMatchObject({ type: "tool_result" });
+  it("parses every user tool result with its call id and error state", () => {
+    const line = JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "tool_1" },
+          { type: "text", text: "ignored" },
+          { type: "tool_result", tool_use_id: "tool_2", is_error: true },
+        ],
+      },
+    });
+    expect([..._parseLinesMulti(line)]).toEqual([
+      expect.objectContaining({
+        type: "tool_finished",
+        callId: "tool_1",
+        isError: false,
+      }),
+      expect.objectContaining({
+        type: "tool_finished",
+        callId: "tool_2",
+        isError: true,
+      }),
+    ]);
   });
 
   it("empty line yields nothing; bad JSON yields raw", () => {
@@ -64,6 +95,45 @@ describe("codex support", () => {
       type: "result",
       stopReason: "turn_completed",
     });
+  });
+
+  it("separates Codex tool start and completion without counting reasoning", () => {
+    const started = [
+      ..._parseLinesMulti(
+        JSON.stringify({
+          type: "item.started",
+          item: { id: "item_tool", type: "command_execution", command: "npm test" },
+        }),
+        "codex",
+      ),
+    ];
+    const completed = [
+      ..._parseLinesMulti(
+        JSON.stringify({
+          type: "item.completed",
+          item: { id: "item_tool", type: "command_execution", status: "completed", exit_code: 0 },
+        }),
+        "codex",
+      ),
+    ];
+    const reasoning = [
+      ..._parseLinesMulti(
+        JSON.stringify({ type: "item.completed", item: { id: "reason_1", type: "reasoning" } }),
+        "codex",
+      ),
+    ];
+
+    expect(started[0]).toMatchObject({
+      type: "tool_started",
+      callId: "item_tool",
+      toolName: "command_execution",
+    });
+    expect(completed[0]).toMatchObject({
+      type: "tool_finished",
+      callId: "item_tool",
+      isError: false,
+    });
+    expect(reasoning[0]).toMatchObject({ type: "raw" });
   });
 
   it("builds codex exec and resume commands", () => {

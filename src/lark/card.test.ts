@@ -3,7 +3,7 @@ import type { AgentStreamEvent } from "../claude/runner.js";
 import {
   CardRenderer,
   _formatDuration,
-  _liveMarkdown,
+  _liveStatusMarkdown,
   _optimizeMarkdownStyle,
   _terminalMarkdown,
   type MarkdownStreamController,
@@ -11,13 +11,17 @@ import {
 } from "./card.js";
 
 function makeHarness(now: () => number = () => 0) {
-  const updates: string[] = [];
+  const statusUpdates: string[] = [];
+  const bodyUpdates: string[] = [];
   const replacements: object[] = [];
   let storedMarkdown: string | undefined;
   const controller: MarkdownStreamController = {
     messageId: "om_stream",
+    setStatus: vi.fn(async (content: string) => {
+      statusUpdates.push(content);
+    }),
     setContent: vi.fn(async (content: string) => {
-      updates.push(content);
+      bodyUpdates.push(content);
     }),
   };
   const outbound: OutboundCardClient = {
@@ -28,7 +32,10 @@ function makeHarness(now: () => number = () => 0) {
     replaceCard: vi.fn(async (_messageId, card) => {
       replacements.push(card);
       const body = card as { body?: { elements?: Array<{ content?: string }> } };
-      storedMarkdown = body.body?.elements?.[0]?.content;
+      storedMarkdown = body.body?.elements
+        ?.map((element) => element.content?.replace(/\u200b/g, "") ?? "")
+        .filter(Boolean)
+        .join("\n\n");
     }),
     readCardMarkdown: vi.fn(async () => storedMarkdown),
     releaseCard: vi.fn(),
@@ -37,24 +44,52 @@ function makeHarness(now: () => number = () => 0) {
     renderer: new CardRenderer({ outbound, now, sleep: async () => undefined }),
     outbound,
     controller,
-    updates,
+    statusUpdates,
+    bodyUpdates,
     replacements,
   };
 }
 
-describe("CardRenderer native markdown stream", () => {
+describe("CardRenderer managed markdown stream", () => {
+  it("replaces multi-paragraph snapshots without duplicating earlier paragraphs", async () => {
+    const { renderer, bodyUpdates } = makeHarness();
+    const card = await renderer.start("chat", "user");
+    card.handle({ type: "text_delta", text: "第一段\n\n第二段", raw: { item: { id: "same" } } });
+    await new Promise(resolve => setImmediate(resolve));
+    card.handle({ type: "text_delta", text: "第一段\n\n第二段继续", raw: { item: { id: "same" } } });
+    await card.finalize({ success: true });
+    expect(bodyUpdates.at(-1)).toBe("第一段\n\n第二段继续");
+  });
+
+  it("refreshes elapsed time during silence and stops the heartbeat at finalization", async () => {
+    vi.useFakeTimers();
+    try {
+      const { renderer, statusUpdates } = makeHarness(() => Date.now());
+      const card = await renderer.start("chat", "user");
+      card.handle({ type: "raw", raw: { type: "heartbeat" } });
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(statusUpdates.at(-1)).toContain("已用时 15 秒");
+      expect(statusUpdates.at(-1)).toContain("最近收到 Agent 活动");
+      await card.finalize({ success: true, finalText: "done" });
+      const count = statusUpdates.length;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(statusUpdates).toHaveLength(count);
+    } finally { vi.useRealTimers(); }
+  });
   it("starts a threaded stream with explicit chat and reply ids", async () => {
     const { renderer, outbound, controller } = makeHarness();
     const card = await renderer.start("oc_chat", "om_user", { replyInThread: true });
 
     expect(card.messageId).toBe("om_stream");
-    expect(controller.setContent).toHaveBeenCalledWith(
-      "> ⏳ **正在处理**\n> Agent 正在思考或执行任务...",
-    );
+    expect(controller.setStatus).not.toHaveBeenCalled();
+    expect(controller.setContent).not.toHaveBeenCalled();
     expect(outbound.streamMarkdown).toHaveBeenCalledWith(
       "oc_chat",
       "om_user",
-      { replyInThread: true },
+      {
+        replyInThread: true,
+        initialStatus: "> ⏳ **正在处理**\n> Agent 正在思考或执行任务...",
+      },
       expect.any(Function),
     );
     await card.finalize({ success: true, finalText: "完成" });
@@ -64,6 +99,12 @@ describe("CardRenderer native markdown stream", () => {
       expect.objectContaining({
         schema: "2.0",
         config: expect.objectContaining({ streaming_mode: false }),
+        body: {
+          elements: [
+            expect.objectContaining({ element_id: "status_md" }),
+            expect.objectContaining({ element_id: "stream_md", content: "完成" }),
+          ],
+        },
       }),
     );
     expect(outbound.readCardMarkdown).toHaveBeenCalledWith("om_stream");
@@ -71,7 +112,7 @@ describe("CardRenderer native markdown stream", () => {
   });
 
   it("replaces partial snapshots and commits clean final markdown", async () => {
-    const { renderer, updates } = makeHarness();
+    const { renderer, statusUpdates, bodyUpdates } = makeHarness();
     const card = await renderer.start("oc_chat", "om_user");
     const first: AgentStreamEvent = {
       type: "text_delta",
@@ -88,53 +129,122 @@ describe("CardRenderer native markdown stream", () => {
 
     await card.finalize({ success: true });
 
-    expect(updates.at(-1)).toBe(
-      "> ✅ **回复完成**\n> ⏱️ 处理耗时：不到 1 秒\n\n#### 最终答案\n\n内容",
+    expect(statusUpdates.at(-1)).toBe(
+      "> ✅ **回复完成**\n> ⏱️ 处理耗时：不到 1 秒",
     );
+    expect(bodyUpdates.at(-1)).toBe("#### 最终答案\n\n内容");
   });
 
   it("keeps multiple assistant turns separated", async () => {
-    const { renderer, updates } = makeHarness();
+    const { renderer, bodyUpdates } = makeHarness();
     const card = await renderer.start("oc_chat", "om_user");
     card.handle({ type: "text_delta", text: "第一段", raw: { message: { id: "msg_1" } } });
     card.handle({ type: "text_delta", text: "第二段", raw: { message: { id: "msg_2" } } });
 
     await card.finalize({ success: true });
 
-    expect(updates.at(-1)).toBe(
-      "> ✅ **回复完成**\n> ⏱️ 处理耗时：不到 1 秒\n\n第一段\n\n第二段",
-    );
+    expect(bodyUpdates.at(-1)).toBe("第一段\n\n第二段");
   });
 
   it("shows elapsed processing time when the stream finishes", async () => {
     let nowMs = 1_000;
-    const { renderer, updates } = makeHarness(() => nowMs);
+    const { renderer, statusUpdates } = makeHarness(() => nowMs);
     const card = await renderer.start("oc_chat", "om_user", { startedAtMs: nowMs });
     nowMs += 65_000;
 
     await card.finalize({ success: true, finalText: "完成" });
 
-    expect(updates.at(-1)).toBe(
-      "> ✅ **回复完成**\n> ⏱️ 处理耗时：1 分钟 5 秒\n\n完成",
+    expect(statusUpdates.at(-1)).toBe(
+      "> ✅ **回复完成**\n> ⏱️ 处理耗时：1 分钟 5 秒",
     );
   });
 
-  it("shows only generic pre-answer progress and never exposes tool input", async () => {
-    const { renderer, updates } = makeHarness();
+  it("shows live tool counts and never exposes tool input or raw paths", async () => {
+    const { renderer, statusUpdates, bodyUpdates } = makeHarness();
     const card = await renderer.start("oc_chat", "om_user");
     card.handle({
-      type: "tool_use",
+      type: "tool_started",
+      callId: "tool_1",
       toolName: "Read",
-      toolInput: { file_path: "/private/secret/path" },
-      raw: {},
+      raw: { input: { file_path: "/private/secret/path" } },
     });
-    await Promise.resolve();
+    card.handle({
+      type: "text_delta",
+      text: "正在生成的正文",
+      raw: { message: { id: "msg_1" } },
+    });
+    card.handle({
+      type: "tool_finished",
+      callId: "tool_1",
+      isError: false,
+      raw: { output: "token=secret" },
+    });
     await card.finalize({ success: false, failureReason: "token=secret" });
 
-    expect(updates.some((content) => content.includes("正在查找资料..."))).toBe(true);
-    expect(updates.at(-1)).toContain("**处理失败**");
-    expect(updates.join("\n")).not.toContain("/private/secret/path");
-    expect(updates.join("\n")).not.toContain("token=secret");
+    expect(
+      statusUpdates.some((content) =>
+        content.includes("已调用 1 次 · 已完成 1 次 · 进行中 0"),
+      ),
+    ).toBe(true);
+    expect(bodyUpdates).toContain("正在生成的正文");
+    expect(statusUpdates.at(-1)).toContain("**处理失败**");
+    expect(statusUpdates.at(-1)).toContain("共调用 1 次工具");
+    expect([...statusUpdates, ...bodyUpdates].join("\n")).not.toContain("/private/secret/path");
+    expect([...statusUpdates, ...bodyUpdates].join("\n")).not.toContain("token=secret");
+  });
+
+  it("deduplicates lifecycle events and summarizes parallel active tools", async () => {
+    const { renderer, statusUpdates } = makeHarness();
+    const card = await renderer.start("oc_chat", "om_user");
+    const readStarted: AgentStreamEvent = {
+      type: "tool_started",
+      callId: "tool_1",
+      toolName: "Read",
+      raw: {},
+    };
+    card.handle(readStarted);
+    card.handle(readStarted);
+    card.handle({ type: "tool_started", callId: "tool_2", toolName: "Bash", raw: {} });
+    card.handle({ type: "tool_started", callId: "tool_3", toolName: "custom_tool", raw: {} });
+    card.handle({ type: "tool_finished", callId: "tool_1", isError: false, raw: {} });
+    card.handle({ type: "tool_finished", callId: "tool_1", isError: false, raw: {} });
+
+    await card.finalize({ success: true, finalText: "完成" });
+
+    expect(
+      statusUpdates.some(
+        (content) =>
+          content.includes("已调用 3 次 · 已完成 1 次 · 进行中 2") &&
+          content.includes("正在调用：执行命令、custom tool"),
+      ),
+    ).toBe(true);
+    expect(statusUpdates.at(-1)).toContain("共调用 3 次工具");
+  });
+
+  it("never rewrites the answer element when tool status changes", async () => {
+    const { renderer, statusUpdates, bodyUpdates } = makeHarness();
+    const card = await renderer.start("oc_chat", "om_user");
+
+    card.handle({ type: "text_delta", text: "前半", raw: { message: { id: "msg_1" } } });
+    await vi.waitFor(() => expect(bodyUpdates).toEqual(["前半"]));
+
+    card.handle({ type: "tool_started", callId: "tool_1", toolName: "Read", raw: {} });
+    await vi.waitFor(() => expect(statusUpdates.at(-1)).toContain("正在调用：查找资料"));
+    expect(bodyUpdates).toEqual(["前半"]);
+
+    card.handle({ type: "tool_finished", callId: "tool_1", isError: false, raw: {} });
+    await vi.waitFor(() => expect(statusUpdates.at(-1)).toContain("正在整理结果"));
+    expect(bodyUpdates).toEqual(["前半"]);
+
+    card.handle({
+      type: "text_delta",
+      text: "前半后半",
+      raw: { message: { id: "msg_1" } },
+    });
+    await vi.waitFor(() => expect(bodyUpdates).toEqual(["前半", "前半后半"]));
+    expect(bodyUpdates[1]?.startsWith(bodyUpdates[0] ?? "")).toBe(true);
+
+    await card.finalize({ success: true });
   });
 
   it("surfaces stream creation failures from start", async () => {
@@ -192,12 +302,16 @@ describe("CardRenderer native markdown stream", () => {
     const stored = new Map<string, string>();
     const replaceCard = vi.fn(async (messageId: string, card: object) => {
       const body = card as { body?: { elements?: Array<{ content?: string }> } };
-      stored.set(messageId, body.body?.elements?.[0]?.content ?? "");
+      stored.set(
+        messageId,
+        body.body?.elements?.map((element) => element.content ?? "").join("\n\n") ?? "",
+      );
     });
     const outbound: OutboundCardClient = {
       streamMarkdown: vi.fn(async (_chatId, replyTo, _opts, producer) => {
         const controller: MarkdownStreamController = {
           messageId: `card_${replyTo}`,
+          setStatus: vi.fn(async () => undefined),
           setContent: vi.fn(async () => undefined),
         };
         await producer(controller);
@@ -225,9 +339,23 @@ describe("CardRenderer native markdown stream", () => {
 });
 
 describe("markdown presentation", () => {
-  it("keeps processing status visible after answer text starts", () => {
-    expect(_liveMarkdown("正在生成的正文"))
-      .toBe("> ⏳ **正在处理**\n\n正在生成的正文");
+  it("keeps processing status independent from answer text", () => {
+    expect(_liveStatusMarkdown())
+      .toBe("> ⏳ **正在处理**\n> Agent 正在思考或执行任务...");
+  });
+
+  it("renders compact tool activity in the status element", () => {
+    expect(
+      _liveStatusMarkdown({
+        startedCount: 4,
+        completedCount: 1,
+        activeNames: ["查找资料", "执行命令", "修改文件"],
+      }),
+    ).toBe(
+      "> ⏳ **正在处理**\n" +
+        "> 🔧 已调用 4 次 · 已完成 1 次 · 进行中 3\n" +
+        "> 正在调用：查找资料、执行命令，另有 1 个",
+    );
   });
 
   it("demotes chat headings without changing fenced code", () => {

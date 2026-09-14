@@ -16,6 +16,17 @@ afterEach(async () => {
 });
 
 describe("SessionStore", () => {
+  it("persists concurrent turns without sharing an in-flight temporary file", async () => {
+    const store = await SessionStore.load(file);
+    const writes = Array.from({ length: 5 }, (_, index) => store.put({
+      threadId: `t${index}`, sessionId: `s${index}`, createdTs: 1, lastActiveTs: 2,
+    }));
+    await store.close();
+    await Promise.all(writes);
+    const reloaded = await SessionStore.load(file);
+    expect(reloaded.list()).toHaveLength(5);
+    expect(reloaded.get("t4")?.sessionId).toBe("s4");
+  });
   it("creates an empty store when file is absent", async () => {
     const store = await SessionStore.load(file);
     expect(store.list()).toHaveLength(0);

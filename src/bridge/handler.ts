@@ -39,6 +39,9 @@ export interface BridgeHandlerDeps {
 export class BridgeHandler {
   private readonly deps: BridgeHandlerDeps;
   private closed = false;
+  private readonly controllers = new Set<AbortController>();
+  private readonly tasks = new Set<Promise<void>>();
+  private closing: Promise<void> | undefined;
 
   constructor(deps: BridgeHandlerDeps) {
     this.deps = deps;
@@ -81,8 +84,11 @@ export class BridgeHandler {
         continue;
       }
       if (decision === "close") {
+        inflight.get(key)?.abort("resolved");
+        await threadQueues.get(key);
         console.log(`[handler] thread ${key}: marked resolved, clearing session`);
         await this.deps.sessionStore.delete(key);
+        await this.deps.client.discardTask?.(event.message_id);
         continue;
       }
 
@@ -94,29 +100,49 @@ export class BridgeHandler {
         prevController.abort();
       }
       const controller = new AbortController();
+      this.controllers.add(controller);
       inflight.set(key, controller); // becomes the latest turn (overwrites prev)
       const startedAtMs = Date.now();
 
       const prev = threadQueues.get(key) ?? Promise.resolve();
       const next = prev
-        .then(() => acquire())
-        .then(() => this.handleOne(event, controller.signal, startedAtMs))
+        .then(() => this.handleOne(event, controller.signal, startedAtMs, acquire, release))
         .catch((err: unknown) => {
           console.error(`[handler] unhandled error on thread ${key}:`, err);
         })
         .finally(() => {
-          release();
+          this.controllers.delete(controller);
+          this.tasks.delete(next);
+          this.deps.client.settleTask?.(event.message_id);
           // Only the latest turn clears the entries (an aborted older turn must not).
           if (inflight.get(key) === controller) inflight.delete(key);
           if (threadQueues.get(key) === next) threadQueues.delete(key);
         });
       threadQueues.set(key, next);
+      this.tasks.add(next);
     }
   }
 
-  /** Soft-close: run() exits at the next loop iteration; in-flight turns finish. */
+  /** Stop admission, interrupt every owned turn, then drain terminal delivery. */
   async close(): Promise<void> {
     this.closed = true;
+    this.deps.client.stopAccepting?.();
+    for (const controller of this.controllers) controller.abort("shutdown");
+    this.closing ??= (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([...this.tasks]),
+          new Promise<void>(resolve => {
+            timer = setTimeout(() => {
+              console.warn("[handler] shutdown drain timed out; pending cards remain in the delivery journal");
+              resolve();
+            }, 30_000);
+          }),
+        ]);
+      } finally { clearTimeout(timer); }
+    })();
+    await this.closing;
   }
 
   // ---------------------------------------------------------------------------
@@ -137,6 +163,8 @@ export class BridgeHandler {
     event: LarkMessageEvent,
     signal?: AbortSignal,
     startedAtMs = Date.now(),
+    acquire: () => Promise<void> = async () => undefined,
+    release: () => void = () => undefined,
   ): Promise<void> {
     const parsed = parseMessage(event);
     const { threadId, messageId, senderOpenId } = parsed;
@@ -193,6 +221,7 @@ export class BridgeHandler {
           `[handler] skipped message_id=${messageId} thread=${threadId} ` +
             `reason=topic-already-handled reply_message_id=${handledReply.messageId}`,
         );
+        await this.deps.client.discardTask?.(messageId);
         return;
       }
     }
@@ -204,8 +233,15 @@ export class BridgeHandler {
       threadId,
       startedAtMs,
     );
+    // A missing reply surface must not turn into invisible agent execution.
+    if (!card) return;
+    card.setPhase?.("等待执行名额");
+    let acquired = false;
 
     try {
+      await acquire();
+      acquired = true;
+      card.setPhase?.("Agent 正在思考或执行任务");
       // Shared cwd for all topics (e.g. a real repo). Topics stay isolated by
       // their own agent session (--resume/resume by threadId), not by separate dirs.
       const cwd = this.deps.workDir;
@@ -218,7 +254,7 @@ export class BridgeHandler {
       while (true) {
         attempt++;
         if (signal?.aborted) {
-          if (card) await card.finalize({ success: false, interrupted: true });
+          if (card) await card.finalize({ success: false, interrupted: true, interruptionReason: interruptionReason(signal) });
           return;
         }
         const isNewThread = currentExisting === undefined;
@@ -270,16 +306,17 @@ export class BridgeHandler {
           // step aside — the newer turn (already scheduled) resumes the session.
           if (signal?.aborted) {
             console.log(`[handler] thread ${threadId}: turn interrupted, yielding to newer message`);
-            if (card) await card.finalize({ finalText: lastText, success: false, interrupted: true });
+            if (card) await card.finalize({ finalText: lastText, success: false, interrupted: true, interruptionReason: interruptionReason(signal) });
             return;
           }
 
           if (card) {
-            const success = result.exitCode === 0;
+            const success = result.exitCode === 0 && !result.termination && !!lastText.trim();
             const cardBody = lastText.trim()
               ? lastText
               : "⚠️ 本轮没有拿到 agent 的回复(可能被中断),再 @ 我一次重试。";
-            await card.finalize({ finalText: cardBody, success });
+            card.setPhase?.("正在保存回复");
+            await card.finalize({ finalText: cardBody, success, timedOut: result.termination === "timeout" });
           }
           break; // done
         } catch (spawnErr) {
@@ -296,7 +333,7 @@ export class BridgeHandler {
               });
             }
             console.log(`[handler] thread ${threadId}: turn interrupted (during run), yielding`);
-            if (card) await card.finalize({ finalText: lastText, success: false, interrupted: true });
+            if (card) await card.finalize({ finalText: lastText, success: false, interrupted: true, interruptionReason: interruptionReason(signal) });
             return;
           }
           const errMsg = String((spawnErr as Error).message ?? spawnErr);
@@ -332,13 +369,15 @@ export class BridgeHandler {
         try {
           await card.finalize(
             interrupted
-              ? { success: false, interrupted: true }
+              ? { success: false, interrupted: true, interruptionReason: interruptionReason(signal) }
               : { success: false, failureReason: String(err) },
           );
         } catch (finalizeErr) {
           console.error("[handler] finalize also failed:", finalizeErr);
         }
       }
+    } finally {
+      if (acquired) release();
     }
   }
 
@@ -360,6 +399,10 @@ export class BridgeHandler {
       return undefined;
     }
   }
+}
+
+function interruptionReason(signal?: AbortSignal): "shutdown" | "resolved" | undefined {
+  return signal?.reason === "shutdown" || signal?.reason === "resolved" ? signal.reason : undefined;
 }
 
 function eventTimestampMs(value: string): number {

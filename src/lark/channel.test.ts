@@ -21,7 +21,9 @@ const compiledCardContent = JSON.stringify({
     source: "json",
     config: {
       streamingMode: false,
-      summary: { content: "> ✅ **回复完成** > ⏱️ 处理耗时：18 秒 最终答案" },
+      summary: {
+        content: "> ✅ **回复完成** > 🔧 共调用 3 次工具 > ⏱️ 处理耗时：18 秒 最终答案",
+      },
     },
     body: {
       tag: "body",
@@ -37,6 +39,8 @@ const compiledCardContent = JSON.stringify({
                     elements: [
                       { tag: "plain_text", property: { content: "✅" } },
                       { tag: "plain_text", property: { content: "回复完成" } },
+                      { tag: "br" },
+                      { tag: "plain_text", property: { content: "🔧 共调用 3 次工具" } },
                       { tag: "br" },
                       { tag: "plain_text", property: { content: "⏱️ 处理耗时：18 秒" } },
                     ],
@@ -180,10 +184,11 @@ describe("shouldRebuildChannel", () => {
     expect(shouldRebuildChannel({ ...base, staleMs: 0 })).toBe(false);
   });
 
-  it("no rebuild while already rebuilding / closed / disconnected", () => {
+  it("retries disconnected channels but never closed or concurrently rebuilding channels", () => {
     expect(shouldRebuildChannel({ ...base, rebuilding: true })).toBe(false);
     expect(shouldRebuildChannel({ ...base, closed: true })).toBe(false);
-    expect(shouldRebuildChannel({ ...base, connected: false })).toBe(false);
+    expect(shouldRebuildChannel({ ...base, connected: false })).toBe(true);
+    expect(shouldRebuildChannel({ ...base, connected: false, lastRebuildAt: base.now - 1000 })).toBe(false);
   });
 });
 
@@ -209,7 +214,7 @@ describe("channelMsgToLarkEvent", () => {
   });
 });
 
-describe("native streaming card history", () => {
+describe("streaming card history", () => {
   const content = (streamingMode: boolean, markdown: string) =>
     JSON.stringify({
       card_schema: "2.0",
@@ -254,6 +259,35 @@ describe("native streaming card history", () => {
     ).toBe("最终答案");
   });
 
+  it("extracts the answer from a managed two-element card", () => {
+    const managed = JSON.stringify({
+      card_schema: "2.0",
+      json_card: JSON.stringify({
+        schema: "2.0",
+        config: { streaming_mode: true },
+        body: {
+          elements: [
+            {
+              tag: "markdown",
+              element_id: "status_md",
+              content: "> ⏳ **正在处理**\n> 🔧 已调用 1 次 · 已完成 0 次 · 进行中 1",
+            },
+            { tag: "markdown", element_id: "stream_md", content: "\u200b已经生成的正文" },
+          ],
+        },
+      }),
+    });
+
+    expect(_bridgeCardStatus("interactive", managed)).toBe("streaming");
+    expect(
+      _historyMessageText({
+        message_id: "om_managed",
+        msg_type: "interactive",
+        body: { content: managed },
+      }),
+    ).toBe("已经生成的正文");
+  });
+
   it("recognizes and extracts Feishu's compiled CardKit readback", () => {
     expect(_bridgeCardStatus("interactive", compiledCardContent)).toBe("success");
     expect(
@@ -276,23 +310,10 @@ describe("native streaming card history", () => {
 });
 
 describe("ChannelClient final-card recovery transport", () => {
-  it("updates the CardKit entity referenced by the original streaming message", async () => {
-    const nativeController = {
-      messageId: "om_stream",
-      cardId: "card_entity",
-      sequence: 4,
-      setContent: vi.fn(async () => undefined),
-    };
-    const stream = vi.fn(
-      async (
-        _chatId: string,
-        input: { markdown: (controller: typeof nativeController) => Promise<void> },
-      ) => {
-        await input.markdown(nativeController);
-        nativeController.sequence++;
-        return { messageId: nativeController.messageId };
-      },
-    );
+  it("updates separate CardKit elements and keeps replacing the original entity", async () => {
+    const createCard = vi.fn(async () => ({ cardId: "card_entity" }));
+    const send = vi.fn(async () => ({ messageId: "om_stream" }));
+    const updateElement = vi.fn(async () => ({ code: 0 }));
     const updateCardById = vi.fn(async () => undefined);
     const updateCard = vi.fn(async () => undefined);
     const client = new ChannelClient({
@@ -302,17 +323,63 @@ describe("ChannelClient final-card recovery transport", () => {
       deliveryStatePath: "/tmp/fcb-channel-test-delivery.json",
     });
     (client as unknown as { channel: unknown }).channel = {
-      stream,
+      createCard,
+      send,
       updateCard,
       updateCardById,
+      rawClient: {
+        cardkit: { v1: { cardElement: { content: updateElement } } },
+      },
     };
     const outbound = client.outboundCardClient();
     const finalCard = { schema: "2.0", config: { streaming_mode: false } };
 
-    await outbound.streamMarkdown("oc_chat", "om_user", { replyInThread: true }, async () => {});
+    await outbound.streamMarkdown(
+      "oc_chat",
+      "om_user",
+      { replyInThread: true, initialStatus: "> ⏳ **正在处理**" },
+      async (controller) => {
+        await controller.setStatus("> ⏳ **正在处理**\n> 正在调用：查找资料");
+        await controller.setContent("正文");
+      },
+    );
     await outbound.replaceCard("om_stream", finalCard);
 
-    expect(updateCardById).toHaveBeenCalledWith("card_entity", finalCard, 6);
+    expect(createCard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({ streaming_mode: true }),
+        body: {
+          elements: [
+            expect.objectContaining({ element_id: "status_md" }),
+            expect.objectContaining({ element_id: "stream_md", content: "\u200b" }),
+          ],
+        },
+      }),
+    );
+    expect(send).toHaveBeenCalledWith(
+      "oc_chat",
+      { cardId: "card_entity" },
+      { replyTo: "om_user", replyInThread: true },
+    );
+    expect(updateElement).toHaveBeenNthCalledWith(1, {
+      path: { card_id: "card_entity", element_id: "status_md" },
+      data: {
+        content: "> ⏳ **正在处理**\n> 正在调用：查找资料",
+        sequence: 1,
+        uuid: "c_card_entity_1",
+      },
+    });
+    expect(updateElement).toHaveBeenNthCalledWith(2, {
+      path: { card_id: "card_entity", element_id: "stream_md" },
+      data: { content: "\u200b正文", sequence: 2, uuid: "c_card_entity_2" },
+    });
+    expect(updateCardById).toHaveBeenNthCalledWith(
+      1,
+      "card_entity",
+      expect.objectContaining({ config: expect.objectContaining({ streaming_mode: false }) }),
+      3,
+    );
+    expect(updateCardById).toHaveBeenNthCalledWith(2, "card_entity", finalCard, 4);
     expect(updateCard).not.toHaveBeenCalled();
 
     outbound.releaseCard?.("om_stream");

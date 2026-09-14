@@ -103,6 +103,21 @@ function makeHandler(deps: ReturnType<typeof makeDeps>) {
 }
 
 describe("BridgeHandler.handleOne", () => {
+  it("does not re-execute the agent when final delivery fails", async () => {
+    runAgentMock.mockReturnValue(fakeRun([{ type: "text_delta", text: "已经执行成功", raw: {} }]));
+    const deps = makeDeps([topEvent("test")]);
+    const settleTask = vi.fn();
+    Object.assign(deps.client, { settleTask });
+    deps.cardRenderer.start.mockResolvedValueOnce({
+      messageId: "reply", handle: () => 0,
+      finalize: async () => { throw new Error("final delivery pending"); },
+    });
+    const handler = makeHandler(deps);
+    await handler.run();
+    await waitFor(() => settleTask.mock.calls.length === 1);
+    expect(runAgentMock).toHaveBeenCalledTimes(1);
+    expect(settleTask).toHaveBeenCalledWith("om_top");
+  });
   it("ignores a new top-level message that does not mention the bot", async () => {
     runAgentMock.mockReturnValue(
       fakeRun([{ type: "text_delta", text: "should not run", raw: {} }]),
@@ -433,6 +448,27 @@ function inThreadReply(
 }
 
 describe("BridgeHandler interrupt (same-thread)", () => {
+  it("shows queued cards before obtaining a slot and drains interrupted cards on close", async () => {
+    runAgentMock.mockImplementation(opts => abortableRun(opts, "session"));
+    const deps = makeDeps(Array.from({ length: 6 }, (_, i) => topLevelEvent(`task_${i}`, "test")));
+    const handler = makeHandler(deps);
+    await handler.run();
+    await waitFor(() => runAgentMock.mock.calls.length === 5);
+    expect(deps.cardRenderer.start).toHaveBeenCalledTimes(6);
+    await handler.close();
+    expect(deps.card.finalizeArgs).toMatchObject({ interrupted: true, interruptionReason: "shutdown" });
+    expect(runAgentMock).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not execute an invisible task after initial card creation fails", async () => {
+    const deps = makeDeps([topEvent("test")]);
+    deps.cardRenderer.start.mockRejectedValueOnce(new Error("network unavailable"));
+    const handler = makeHandler(deps);
+    await handler.run();
+    await waitFor(() => deps.cardRenderer.start.mock.calls.length === 1);
+    await handler.close();
+    expect(runAgentMock).not.toHaveBeenCalled();
+  });
   it("a new same-thread message interrupts the in-flight turn and resumes the session", async () => {
     runAgentMock
       .mockImplementationOnce((opts) => abortableRun(opts, "sess_A")) // turn 1: runs until aborted

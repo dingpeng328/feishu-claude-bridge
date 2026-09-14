@@ -5,7 +5,7 @@
  * BridgeHandler → run the main loop. Graceful shutdown on SIGINT/SIGTERM.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { loadConfig } from "./config.js";
@@ -53,7 +53,7 @@ function acquireSingleInstanceLock(pidPath: string): string {
 
 function checkAgent(bin: string): string | null {
   try {
-    return execSync(`${bin} --version`, { stdio: ["pipe", "pipe", "pipe"] })
+    return execFileSync(bin, ["--version"], { stdio: ["pipe", "pipe", "pipe"], timeout: 5000 })
       .toString()
       .trim()
       .split("\n")[0] ?? "";
@@ -124,6 +124,10 @@ async function main(): Promise<void> {
   async function shutdown(signal: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
+    const shutdownDeadline = setTimeout(() => {
+      console.error("[feishu-claude-bridge] shutdown deadline exceeded; pending delivery will recover on next start");
+      process.exit(1);
+    }, 45_000);
     console.log(`\n[feishu-claude-bridge] ${signal} — shutting down…`);
     await handler.close();
     await client.close();
@@ -134,6 +138,7 @@ async function main(): Promise<void> {
       /* already gone */
     }
     console.log("[feishu-claude-bridge] bye.");
+    clearTimeout(shutdownDeadline);
     process.exit(0);
   }
   process.on("SIGINT", () => void shutdown("SIGINT"));

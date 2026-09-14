@@ -35,6 +35,7 @@ interface LoadOptions {
 export class SessionStore {
   readonly #filePath: string;
   readonly #map: Map<string, SessionRecord>;
+  #writes: Promise<void> = Promise.resolve();
 
   private constructor(filePath: string, map: Map<string, SessionRecord>) {
     this.#filePath = filePath;
@@ -99,17 +100,21 @@ export class SessionStore {
   }
 
   async close(): Promise<void> {
-    // No debounced writes outstanding (put/delete flush synchronously); kept for
-    // a uniform shutdown contract with main.ts.
+    await this.#writes;
   }
 
   /** Atomic write: serialize → write .tmp → rename (POSIX atomic). */
-  async #flush(): Promise<void> {
+  #flush(): Promise<void> {
     const file: StoreFile = { records: Object.fromEntries(this.#map) };
     const tmpPath = `${this.#filePath}.tmp`;
-    await mkdir(dirname(this.#filePath), { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(file, null, 2), "utf8");
-    await rename(tmpPath, this.#filePath);
+    const snapshot = JSON.stringify(file, null, 2);
+    const write = this.#writes.catch(() => undefined).then(async () => {
+      await mkdir(dirname(this.#filePath), { recursive: true });
+      await writeFile(tmpPath, snapshot, { encoding: "utf8", mode: 0o600 });
+      await rename(tmpPath, this.#filePath);
+    });
+    this.#writes = write;
+    return write;
   }
 }
 

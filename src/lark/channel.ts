@@ -14,7 +14,9 @@ import type { LarkMessageEvent } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { extractMessageText } from "./message.js";
 import { INITIAL_STREAM_TEXT, type OutboundCardClient } from "./card.js";
+import { ManagedMarkdownStream, managedCardSpec, splitManagedMarkdown, type ManagedCardTransport } from "./cardStream.js";
 import { DeliveryState } from "./deliveryState.js";
+import { TurnJournal } from "./turnJournal.js";
 
 // ---------------------------------------------------------------------------
 // Minimal structural slice of the SDK surface we touch.
@@ -57,19 +59,25 @@ interface LarkChannel {
   on(event: "error", handler: (err: { code?: string; message?: string }) => void): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  updateCard(messageId: string, card: object): Promise<void>;
-  updateCardById(cardId: string, card: object, sequence: number): Promise<void>;
-  stream(
+  send(
     chatId: string,
-    input: {
-      markdown: (controller: {
-        readonly messageId: string;
-        setContent(fullContent: string): Promise<void>;
-      }) => Promise<void>;
-    },
+    input: { cardId: string },
     opts: { replyTo: string; replyInThread: boolean },
   ): Promise<{ messageId: string }>;
+  createCard(card: object): Promise<{ cardId: string }>;
+  updateCard(messageId: string, card: object): Promise<void>;
+  updateCardById(cardId: string, card: object, sequence: number): Promise<void>;
   rawClient: {
+    cardkit: {
+      v1: {
+        cardElement: {
+          content(payload: {
+            path: { card_id: string; element_id: string };
+            data: { content: string; sequence: number; uuid: string };
+          }): Promise<{ code?: number; msg?: string } | void>;
+        };
+      };
+    };
     im: {
       v1: {
         chat: {
@@ -111,17 +119,6 @@ interface LarkChannel {
       };
     };
   };
-}
-
-/**
- * Runtime fields carried by the pinned SDK's native markdown controller.
- * They are intentionally kept behind this narrow adapter: the public SDK type
- * omits them, but they identify the CardKit entity that the message references.
- */
-interface NativeCardKitController {
-  readonly messageId: string;
-  readonly cardId?: string;
-  sequence?: number;
 }
 
 const THREAD_HISTORY_TIMEOUT_MS = 15_000;
@@ -301,8 +298,8 @@ function compiledCardText(value: unknown): string {
   return "";
 }
 
-function cardMarkdownContents(card: Record<string, unknown>): string[] {
-  const contents: string[] = [];
+function cardMarkdownValues(card: Record<string, unknown>): Array<{ text: string; source: boolean }> {
+  const contents: Array<{ text: string; source: boolean }> = [];
   const visit = (value: unknown): void => {
     if (Array.isArray(value)) {
       value.forEach(visit);
@@ -318,11 +315,11 @@ function cardMarkdownContents(card: Record<string, unknown>): string[] {
       ?? directString(property, "element_id")
       ?? directString(property, "elementId");
     if (tag === "markdown" || elementId === "stream_md") {
-      const content =
+      const source =
         directString(record, "content")
-        ?? directString(property, "content")
-        ?? compiledCardText(record);
-      if (content?.trim()) contents.push(content.trim());
+        ?? directString(property, "content");
+      const content = source ?? compiledCardText(record);
+      if (content?.trim()) contents.push({ text: content.trim(), source: source !== undefined });
       return;
     }
     Object.values(record).forEach(visit);
@@ -331,12 +328,17 @@ function cardMarkdownContents(card: Record<string, unknown>): string[] {
   return contents;
 }
 
+function cardMarkdownContents(card: Record<string, unknown>): string[] {
+  return cardMarkdownValues(card).map(value => value.text);
+}
+
 function cardSummaryContent(card: Record<string, unknown>): string | undefined {
   const config = directRecord(card["config"]);
   return directString(directRecord(config?.["summary"]), "content");
 }
 
 function statusFromCardText(text: string): ThreadContextMessage["cardStatus"] {
+  if (text.includes("处理已中断")) return "interrupted";
   if (text.includes("**处理失败**") || text.includes("处理失败")) return "failure";
   if (text.includes("**已被新消息打断**") || text.includes("已被新消息打断")) {
     return "interrupted";
@@ -369,10 +371,9 @@ function bridgeCardStatus(
   const streamingMode =
     findCardField(card["config"], "streaming_mode")
     ?? findCardField(card["config"], "streamingMode");
-  const cardText = [cardSummaryContent(card), ...cardMarkdownContents(card)]
-    .filter((part): part is string => Boolean(part))
-    .join("\n\n");
-  const status = statusFromCardText(cardText);
+  const cardText = (cardMarkdownContents(card)[0] ?? cardSummaryContent(card) ?? "").split("\n", 1)[0] ?? "";
+  const status = statusFromCardText(cardText)
+    ?? statusFromCardText(cardSummaryContent(card)?.split("\n", 1)[0] ?? "");
   if (elementId !== "stream_md" && status === undefined) return undefined;
   if (streamingMode === true) return "streaming";
   return status ?? (streamingMode === false ? "success" : undefined);
@@ -391,8 +392,39 @@ function interactiveCardVerificationText(content: string): string {
     .join("\n\n");
 }
 
+function normalizedCardText(text: string): string {
+  return text.replace(/\u200b/g, "").replace(/\r\n?/g, "\n").trim();
+}
+
+/** Ignore presentation syntax only for Feishu's compiled Markdown response.
+ * Both status and the entire body must match; a summary marker alone is never
+ * accepted as proof that an answer was delivered.
+ */
+function visibleMarkdown(text: string): string {
+  return normalizedCardText(text)
+    .replace(/^\s*```[^\n]*$/gm, "")
+    .replace(/^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)/gm, "")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/[*_`~]/g, "")
+    .replace(/\s+/g, "");
+}
+
+export function finalCardMatches(content: string, expected: object): boolean {
+  const actual = parseInteractiveCard(content);
+  if (!actual || findCardField(actual["config"], "streaming_mode") === true
+    || findCardField(actual["config"], "streamingMode") === true) return false;
+  const wanted = cardMarkdownContents(expected as Record<string, unknown>);
+  const received = cardMarkdownValues(actual);
+  if (wanted.length !== received.length || wanted.length < 2) return false;
+  return wanted.every((text, index) =>
+    normalizedCardText(text) === normalizedCardText(received[index]?.text ?? "")
+    || (!received[index]?.source && visibleMarkdown(text) === visibleMarkdown(received[index]?.text ?? "")));
+}
+
 function stripBridgeStatusBlock(markdown: string): string {
-  const lines = markdown.split("\n");
+  // Managed streaming cards keep the answer element alive with a zero-width
+  // prefix before the first token. It is transport scaffolding, not history.
+  const lines = markdown.replace(/\u200b/g, "").split("\n");
   const firstLine = lines[0]?.replace(/\s+/g, "") ?? "";
   const rawStatus = /^> (?:⏳ \*\*正在处理\*\*|✅ \*\*回复完成\*\*|❌ \*\*处理失败\*\*|⏸️ \*\*已被新消息打断\*\*)$/u.test(lines[0] ?? "");
   const compiledStatus = /^(?:⏳正在处理|✅回复完成|❌处理失败|⏸️已被新消息打断)$/u.test(firstLine);
@@ -403,7 +435,11 @@ function stripBridgeStatusBlock(markdown: string): string {
   if (rawStatus) {
     while (lines[bodyStart]?.startsWith("> ")) bodyStart++;
   } else {
-    while (/^(?:⏱️|正在按新消息继续处理|请稍后重试)/u.test(lines[bodyStart] ?? "")) {
+    while (
+      /^(?:⏱️|🔧|正在调用：|正在整理结果|正在按新消息继续处理|请稍后重试)/u.test(
+        lines[bodyStart]?.replace(/\s+/g, "") ?? "",
+      )
+    ) {
       bodyStart++;
     }
   }
@@ -655,7 +691,8 @@ export function shouldRebuildChannel(a: {
   cooldownMs: number;
   refreshMs: number;
 }): boolean {
-  if (!a.connected || a.rebuilding || a.closed) return false;
+  if (a.rebuilding || a.closed) return false;
+  if (!a.connected) return a.now - a.lastRebuildAt >= 30_000;
   const staleAfterReconnect =
     a.staleMs > 0 &&
     a.lastReconnectAt > a.lastInboundAt &&
@@ -690,6 +727,14 @@ export class ChannelClient {
   private catchUpPending = false;
   private catchUpDisabledReason: string | null = null;
   private lastChatDiscoveryAt = 0;
+  private accepting = true;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnectFailures = 0;
+  private journal: TurnJournal | undefined;
+  private readonly recoveryIds = new Set<string>();
+  private recoveryRunning: Promise<void> | undefined;
+  private recoveryTimer: ReturnType<typeof setInterval> | undefined;
+  private inboundWrites: Promise<void> = Promise.resolve();
 
   constructor(opts: ChannelClientOptions) {
     if (!opts.appId || !opts.appSecret) {
@@ -811,7 +856,15 @@ export class ChannelClient {
   async connect(): Promise<void> {
     if (this.closed || this.connected) return;
     this.deliveryState ??= await DeliveryState.load(this.opts.deliveryStatePath);
-    await this.connectChannel();
+    if (!this.journal) {
+      this.journal = await TurnJournal.load(`${this.opts.deliveryStatePath}.pending.json`);
+      for (const turn of this.journal.list()) this.recoveryIds.add(turn.messageId);
+    }
+    try { await this.connectChannel(); }
+    catch (err) {
+      console.warn(`[channel] connect failed; scheduling retry: ${safeErrorMessage(err)}`);
+      this.scheduleReconnect();
+    }
   }
 
   private async connectChannel(): Promise<void> {
@@ -824,25 +877,16 @@ export class ChannelClient {
     ) as unknown as LarkChannel;
 
     channel.on("message", (msg) => {
-      if (this.closed) return;
+      if (this.closed || !this.accepting || this.channel !== channel) return;
       this.lastInboundAt = Date.now(); // inbound arrived → reset watchdog high-water mark
       const ev = channelMsgToLarkEvent(msg);
       if (!ev) {
         log(`dropped unmappable message ${String(msg.messageId ?? "?")}`);
         return;
       }
-      this.deliveryState?.rememberChat(ev.chat_id);
-      if (ev.mentioned_bot === true) {
-        if (this.deliveryState?.hasSeen(ev.message_id)) {
-          log(`duplicate mention skipped message_id=${ev.message_id}`);
-          return;
-        }
-        this.deliveryState?.rememberMention(ev.message_id, eventTimestampMs(ev.create_time));
-      }
-      log(
-        `dispatching message_id=${ev.message_id} root_id=${ev.root_id ?? "·"} thread_id=${ev.thread_id ?? "·"}`,
-      );
-      this.queue.push(ev);
+      this.inboundWrites = this.inboundWrites.then(() => this.acceptEvent(ev)).catch(err => {
+        console.error(`[channel] could not durably accept ${ev.message_id}: ${safeErrorMessage(err)}`);
+      });
     });
     channel.on("reconnecting", () => log("WS reconnecting…"));
     channel.on("reconnected", () => {
@@ -856,11 +900,20 @@ export class ChannelClient {
 
     this.channel = channel;
     await channel.connect();
+    if (this.closed) { await channel.disconnect(); return; }
     this.connected = true;
+    this.reconnectFailures = 0;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
     this.connectedAt = Date.now();
     // Fresh connection isn't immediately judged stale.
     this.lastInboundAt = Date.now();
     log(`connected as ${channel.botIdentity?.name ?? "?"} (${channel.botIdentity?.openId ?? "?"})`);
+    if (!this.recoveryTimer) {
+      this.recoveryTimer = setInterval(() => this.requestRecovery(), 15_000);
+      this.recoveryTimer.unref();
+    }
+    this.requestRecovery();
 
     // (Re)arm the silent-deaf watchdog. clearInterval first so a rebuild never leaks a timer.
     if (this.staleTimer) {
@@ -884,6 +937,115 @@ export class ChannelClient {
       this.catchUpTimer.unref();
       this.requestCatchUp("connect");
     }
+  }
+
+  private async acceptEvent(ev: LarkMessageEvent): Promise<void> {
+    if (!this.accepting || this.closed || this.deliveryState?.hasSeen(ev.message_id)) return;
+    if (this.recoveryIds.has(ev.message_id)) return;
+    if (ev.chat_type !== "p2p" && ev.mentioned_bot !== true) return;
+    await this.journal?.begin({
+      messageId: ev.message_id, chatId: ev.chat_id,
+      replyInThread: !ev.root_id, startedAtMs: Date.now(),
+    });
+    this.deliveryState?.rememberChat(ev.chat_id);
+    this.deliveryState?.rememberMention(ev.message_id, eventTimestampMs(ev.create_time));
+    await this.deliveryState?.close();
+    console.log(`[channel] dispatching message_id=${ev.message_id}`);
+    this.queue.push(ev);
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || this.reconnectTimer) return;
+    const delay = Math.min(30_000, 1000 * 2 ** Math.min(this.reconnectFailures++, 5));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (!this.closed) void this.rebuildChannel();
+    }, delay);
+    this.reconnectTimer.unref();
+  }
+
+  /** Called only after agent execution has stopped; retries delivery, never execution. */
+  settleTask(messageId: string): void {
+    if (this.journal?.get(messageId)) this.recoveryIds.add(messageId);
+    this.requestRecovery();
+  }
+
+  async discardTask(messageId: string): Promise<void> {
+    this.recoveryIds.delete(messageId);
+    await this.journal?.remove(messageId);
+  }
+
+  private requestRecovery(): void {
+    if (this.closed || !this.connected || this.recoveryRunning || !this.journal || !this.recoveryIds.size) return;
+    this.recoveryRunning = this.recoverDeliveries().catch(err => {
+      console.warn(`[delivery] recovery pending: ${safeErrorMessage(err)}`);
+    }).finally(() => { this.recoveryRunning = undefined; });
+  }
+
+  private async recoverDeliveries(): Promise<void> {
+    for (const id of [...this.recoveryIds]) {
+      if (this.closed) return;
+      const turn = this.journal!.get(id);
+      if (!turn) { this.recoveryIds.delete(id); continue; }
+      const channel = this.channel!;
+      try {
+        const elapsed = Math.max(0, Math.round((Date.now() - turn.startedAtMs) / 1000));
+        const status = `> ⏸️ **处理已中断**\n> ⏱️ 距接收消息已过 ${elapsed} 秒\n> 服务中断或回复交付失败，请重新 @ 我继续。`;
+        const interruptedCard = managedCardSpec(status, "本轮不会自动重复执行。", false);
+        const finalChunks = turn.finalContent ? splitManagedMarkdown(turn.finalContent.body || "\u200b") : undefined;
+        const targetCount = Math.max(1, finalChunks?.length ?? turn.cards.length);
+        const ambiguous = turn.cards.some(card => !card.messageId && card.sendStartedAtMs !== undefined);
+        while (!ambiguous && turn.cards.length < targetCount) {
+          const created = await withTimeout(channel.createCard(managedCardSpec("> ⏳ **正在处理**", "正在恢复回复", false)), SDK_TIMEOUT_MS, "create recovery card");
+          await this.journal!.recordCard(id, created.cardId);
+          turn.cards = this.journal!.get(id)!.cards;
+        }
+        const plans = turn.cards.map((card, index) => ({
+          cardId: card.cardId,
+          card: turn.finalContent
+            ? managedCardSpec(turn.finalContent.status, finalChunks?.[index] ?? "正文已更新至前方卡片。", false)
+            : card.finalCard ?? interruptedCard,
+        }));
+        await this.journal!.saveFinal(id, plans);
+        for (let index = 0; index < turn.cards.length; index++) {
+          const card = turn.cards[index]!;
+          if (!card.messageId && card.sendStartedAtMs === undefined) {
+            await this.journal!.markSending(id, card.cardId);
+            const sent = await withTimeout(channel.send(turn.chatId, { cardId: card.cardId }, { replyTo: id, replyInThread: turn.replyInThread }), SDK_TIMEOUT_MS, "send unsent recovery card");
+            await this.journal!.recordCard(id, card.cardId, sent.messageId);
+            card.messageId = sent.messageId;
+          }
+          const final = plans[index]!.card;
+          const sequence = card.sequence + 1;
+          await this.journal!.reserveSequence(id, card.cardId, sequence);
+          await withTimeout(channel.updateCardById(card.cardId, final, sequence), SDK_TIMEOUT_MS, "recover original card");
+          // A crash during send can leave the remote message id unknown. Do not
+          // send another message in that ambiguous state; retain the journal.
+          if (!card.messageId || !await this.verifyCard(card.messageId, final)) {
+            throw new Error(`original card delivery unconfirmed card_id=${card.cardId}`);
+          }
+        }
+        if (turn.cards.length < targetCount) throw new Error("continuation delivery awaits the original send acknowledgement");
+        await this.discardTask(id);
+        console.log(`[delivery] recovered original cards for message_id=${id}`);
+      } catch (err) {
+        console.warn(`[delivery] retry pending message_id=${id}: ${safeErrorMessage(err)}`);
+      }
+    }
+  }
+
+  private async verifyCard(messageId: string, expected: object): Promise<boolean> {
+    const result = await withTimeout(this.channel!.rawClient.im.v1.message.get({
+      path: { message_id: messageId }, params: { card_msg_content_type: "raw_card_content", with_sender_name: false },
+    }), SDK_TIMEOUT_MS, "verify final card body");
+    if (result.code) throw new Error(`${result.code}: ${result.msg}`);
+    const item = result.data?.items?.find(item => item.message_id === messageId);
+    return !!item?.body?.content && finalCardMatches(item.body.content, expected);
+  }
+
+  stopAccepting(): void {
+    this.accepting = false;
+    this.queue.close();
   }
 
   /** Thin instance wrapper over the pure {@link shouldRebuildChannel} predicate. */
@@ -932,7 +1094,7 @@ export class ChannelClient {
     const channel = this.channel;
     const state = this.deliveryState;
     const botOpenId = channel?.botIdentity?.openId;
-    if (!channel || !state || !botOpenId) return;
+    if (!channel || !state || !botOpenId || !this.accepting || this.closed) return;
 
     const endMs = Date.now();
     const lookbackMs = resolveCatchUpLookbackMs(this.opts.catchUpLookbackMs);
@@ -965,16 +1127,18 @@ export class ChannelClient {
 
     recovered.sort((a, b) => eventTimestampMs(a.create_time) - eventTimestampMs(b.create_time));
     for (const ev of recovered) {
+      if (this.closed || !this.accepting) return;
       if (state.hasSeen(ev.message_id)) continue; // a live event may have won the race
-      state.rememberChat(ev.chat_id);
-      state.rememberMention(ev.message_id, eventTimestampMs(ev.create_time));
       console.log(
         `[catchup] recovered mention message_id=${ev.message_id} chat=${ev.chat_id} root=${ev.root_id ?? "·"}`,
       );
-      this.queue.push(ev);
+      // Serialize live and catch-up acceptance so their dedup check is atomic.
+      const accept = this.inboundWrites.then(() => this.acceptEvent(ev));
+      this.inboundWrites = accept.catch(() => undefined);
+      await accept;
     }
 
-    if (failedChats === 0) state.advanceCursor(endMs);
+    if (failedChats === 0 && this.accepting && !this.closed) state.advanceCursor(endMs);
     if (reason !== "poll" || recovered.length > 0) {
       console.log(
         `[catchup] ${reason}: chats=${chatIds.length} recovered=${recovered.length} failed=${failedChats}`,
@@ -1063,6 +1227,7 @@ export class ChannelClient {
    * in-flight turns + ordering survive. Never throws out of the interval.
    */
   private async rebuildChannel(): Promise<void> {
+    if (this.closed || this.rebuilding) return;
     const log = (s: string) => console.log(`[channel] ${s}`);
     this.rebuilding = true;
     this.lastRebuildAt = Date.now(); // stamp before teardown so the cooldown floor counts from here
@@ -1079,6 +1244,7 @@ export class ChannelClient {
       await this.connectChannel(); // re-handshake, re-subscribe, re-arm watchdog
     } catch (e) {
       log(`channel rebuild failed (will retry next tick): ${e instanceof Error ? e.message : String(e)}`);
+      this.scheduleReconnect();
     } finally {
       this.rebuilding = false;
     }
@@ -1086,6 +1252,9 @@ export class ChannelClient {
 
   async close(): Promise<void> {
     this.closed = true;
+    this.stopAccepting();
+    clearTimeout(this.reconnectTimer);
+    clearInterval(this.recoveryTimer);
     if (this.staleTimer) {
       clearInterval(this.staleTimer);
       this.staleTimer = null;
@@ -1103,44 +1272,110 @@ export class ChannelClient {
     this.connected = false;
     this.connectedAt = 0;
     await this.deliveryState?.close();
+    await this.inboundWrites;
+    await this.journal?.close();
   }
 
-  /** Native CardKit markdown stream bound to the active channel handle. */
+  /** Managed two-element CardKit stream bound to the active channel handle. */
   outboundCardClient(): OutboundCardClient {
+    const client = this;
     const getChannel = (): LarkChannel => {
       if (!this.channel) throw new Error("[channel] outbound called before connect()");
       return this.channel;
     };
-    const activeStreamCards = new Map<string, NativeCardKitController>();
-    return {
-      async streamMarkdown(chatId, replyToMessageId, opts, producer) {
-        return getChannel().stream(
-          chatId,
-          {
-            markdown: async (controller) => {
-              const nativeController = controller as NativeCardKitController;
-              if (nativeController.cardId && typeof nativeController.sequence === "number") {
-                activeStreamCards.set(nativeController.messageId, nativeController);
-              }
-              await producer(controller);
+    const makeTransport = (turnId: string): ManagedCardTransport => ({
+      async createCard(card) {
+        const created = await withTimeout(
+          getChannel().createCard(card),
+          SDK_TIMEOUT_MS,
+          "create managed CardKit entity",
+        );
+        await client.journal?.recordCard(turnId, created.cardId);
+        return created;
+      },
+      async sendCard(chatId, cardId, replyToMessageId, replyInThread) {
+        await client.journal?.markSending(turnId, cardId);
+        const sent = await withTimeout(
+          getChannel().send(
+            chatId,
+            { cardId },
+            { replyTo: replyToMessageId, replyInThread },
+          ),
+          SDK_TIMEOUT_MS,
+          `send managed CardKit entity ${cardId}`,
+        );
+        await client.journal?.recordCard(turnId, cardId, sent.messageId);
+        return sent;
+      },
+      async updateElement(cardId, elementId, content, sequence) {
+        await client.journal?.reserveSequence(turnId, cardId, sequence);
+        const res = await withTimeout(
+          getChannel().rawClient.cardkit.v1.cardElement.content({
+            path: { card_id: cardId, element_id: elementId },
+            data: {
+              content,
+              sequence,
+              uuid: `c_${cardId}_${sequence}`,
             },
-          },
-          {
-            replyTo: replyToMessageId,
-            replyInThread: opts.replyInThread,
-          },
+          }),
+          SDK_TIMEOUT_MS,
+          `update CardKit element ${cardId}/${elementId}`,
+        );
+        if (res && res.code && res.code !== 0) {
+          throw new Error(`${res.code}: ${res.msg ?? "cardElement.content failed"}`);
+        }
+      },
+      async updateCard(cardId, card, sequence) {
+        await client.journal?.reserveSequence(turnId, cardId, sequence);
+        await withTimeout(
+          getChannel().updateCardById(cardId, card, sequence),
+          SDK_TIMEOUT_MS,
+          `update managed CardKit entity ${cardId}`,
         );
       },
+      async saveFinal(plans) { await client.journal?.saveFinal(turnId, plans); },
+      async saveFinalContent(status, body) { await client.journal?.saveFinalContent(turnId, status, body); },
+      async verifyCard(messageId, card) { return client.verifyCard(messageId, card); },
+    });
+    const activeStreamCards = new Map<string, ManagedMarkdownStream>();
+    return {
+      async streamMarkdown(chatId, replyToMessageId, opts, producer) {
+        await client.journal?.begin({ messageId: replyToMessageId, chatId, replyInThread: opts.replyInThread, startedAtMs: Date.now() });
+        const controller = await ManagedMarkdownStream.start({
+          transport: makeTransport(replyToMessageId),
+          chatId,
+          replyToMessageId,
+          replyInThread: opts.replyInThread,
+          initialStatus: opts.initialStatus,
+        });
+        activeStreamCards.set(controller.messageId, controller);
+
+        let producerError: unknown;
+        try {
+          await producer(controller);
+        } catch (err) {
+          producerError = err;
+        }
+
+        try {
+          await controller.complete();
+        } catch (err) {
+          if (producerError !== undefined) {
+            throw new AggregateError(
+              [producerError, err],
+              `managed CardKit producer and finalization failed for ${controller.messageId}`,
+            );
+          }
+          throw err;
+        }
+        if (producerError !== undefined) throw producerError;
+        await client.discardTask(replyToMessageId);
+        return { messageId: controller.messageId };
+      },
       async replaceCard(messageId, card) {
-        const nativeController = activeStreamCards.get(messageId);
-        if (nativeController?.cardId && typeof nativeController.sequence === "number") {
-          const sequence = nativeController.sequence + 1;
-          nativeController.sequence = sequence;
-          await withTimeout(
-            getChannel().updateCardById(nativeController.cardId, card, sequence),
-            SDK_TIMEOUT_MS,
-            `replace final CardKit entity ${messageId}`,
-          );
+        const controller = activeStreamCards.get(messageId);
+        if (controller) {
+          await controller.replaceHead(card);
           return;
         }
         await withTimeout(
