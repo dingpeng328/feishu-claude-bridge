@@ -31,7 +31,25 @@ describe("_parseLinesMulti", () => {
 
   it("parses result with stop_reason", () => {
     const line = JSON.stringify({ type: "result", stop_reason: "end_turn" });
-    expect([..._parseLinesMulti(line)][0]).toMatchObject({ type: "result", stopReason: "end_turn" });
+    expect([..._parseLinesMulti(line)][0]).toMatchObject({
+      type: "result",
+      stopReason: "end_turn",
+      isError: false,
+    });
+  });
+
+  it("parses a failed Claude result as an error result", () => {
+    const line = JSON.stringify({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: true,
+      stop_reason: "error",
+    });
+    expect([..._parseLinesMulti(line)][0]).toMatchObject({
+      type: "result",
+      stopReason: "error",
+      isError: true,
+    });
   });
 
   it("parses every user tool result with its call id and error state", () => {
@@ -94,6 +112,7 @@ describe("codex support", () => {
     expect([..._parseLinesMulti(JSON.stringify({ type: "turn.completed" }), "codex")][0]).toMatchObject({
       type: "result",
       stopReason: "turn_completed",
+      isError: false,
     });
   });
 

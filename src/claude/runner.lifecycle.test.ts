@@ -14,6 +14,54 @@ afterEach(async () => {
 });
 
 describe("runner process lifecycle", () => {
+  it.skipIf(process.platform === "win32")("preserves success when cleaning up a process that lingers after turn.completed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fcb-runner-completed-"));
+    dirs.push(dir);
+    const bin = join(dir, "agent.mjs");
+    await writeFile(bin, `#!/usr/bin/env node
+console.log(JSON.stringify({type:'thread.started',thread_id:'completed-session'}));
+console.log(JSON.stringify({type:'turn.completed'}));
+setInterval(()=>{},100);
+`, { mode: 0o700 });
+
+    const handle = runAgent({
+      agentKind: "codex",
+      agentBinPath: bin,
+      prompt: "test",
+      timeoutMs: 20_000,
+      postResultGraceMs: 25,
+    });
+    for await (const _event of handle.events) { /* drain through cleanup */ }
+
+    await expect(handle.done).resolves.toMatchObject({
+      exitCode: 0,
+      sessionId: "completed-session",
+    });
+    expect((await handle.done).termination).toBeUndefined();
+  });
+
+  it.skipIf(process.platform === "win32")("does not hide a failed Claude result during post-result cleanup", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fcb-runner-failed-"));
+    dirs.push(dir);
+    const bin = join(dir, "agent.mjs");
+    await writeFile(bin, `#!/usr/bin/env node
+console.log(JSON.stringify({type:'system',subtype:'init',session_id:'failed-session'}));
+console.log(JSON.stringify({type:'result',subtype:'error_during_execution',is_error:true,stop_reason:'error'}));
+setInterval(()=>{},100);
+`, { mode: 0o700 });
+
+    const handle = runAgent({
+      agentKind: "claude",
+      agentBinPath: bin,
+      prompt: "test",
+      timeoutMs: 20_000,
+      postResultGraceMs: 25,
+    });
+    for await (const _event of handle.events) { /* drain through cleanup */ }
+
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 1 });
+  });
+
   it.skipIf(process.platform === "win32")("waits for escalation when an exited parent leaves an ignoring tool process", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fcb-runner-tree-")); dirs.push(dir);
     const bin = join(dir, "agent.mjs");

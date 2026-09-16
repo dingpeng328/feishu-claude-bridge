@@ -30,7 +30,7 @@ export type AgentStreamEvent =
   | { type: "text_delta"; text: string; raw: unknown }
   | { type: "tool_started"; callId?: string; toolName: string; raw: unknown }
   | { type: "tool_finished"; callId?: string; toolName?: string; isError: boolean; raw: unknown }
-  | { type: "result"; stopReason: string; raw: unknown }
+  | { type: "result"; stopReason: string; isError: boolean; raw: unknown }
   | { type: "raw"; raw: unknown };
 
 export interface RunOptions {
@@ -44,6 +44,8 @@ export interface RunOptions {
   cwd?: string;
   /** @default 30 min */
   timeoutMs?: number;
+  /** @default 30 seconds; injectable for lifecycle tests. */
+  postResultGraceMs?: number;
   abortSignal?: AbortSignal;
   /** Codex-only execution policy. Omitted preserves the legacy bypass behavior. */
   codexExecutionPolicy?: CodexExecutionPolicy;
@@ -152,7 +154,9 @@ function* parseClaudeObject(obj: unknown): Generator<AgentStreamEvent> {
   }
   if (eventType === "result") {
     const stopReason = typeof record["stop_reason"] === "string" ? record["stop_reason"] : "unknown";
-    yield { type: "result", stopReason, raw: obj };
+    const subtype = typeof record["subtype"] === "string" ? record["subtype"] : "";
+    const isError = record["is_error"] === true || subtype.startsWith("error");
+    yield { type: "result", stopReason, isError, raw: obj };
     return;
   }
   if (eventType === "assistant") {
@@ -229,7 +233,7 @@ function* parseCodexObject(obj: unknown): Generator<AgentStreamEvent> {
     return;
   }
   if (eventType === "turn.completed") {
-    yield { type: "result", stopReason: "turn_completed", raw: obj };
+    yield { type: "result", stopReason: "turn_completed", isError: false, raw: obj };
     return;
   }
   if (eventType === "error") {
@@ -288,6 +292,7 @@ function* parseCodexObject(obj: unknown): Generator<AgentStreamEvent> {
 
 export function runAgent(opts: RunOptions): RunHandle {
   const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000;
+  const postResultGraceMs = opts.postResultGraceMs ?? GRANDCHILD_GRACE_MS;
   const agentKind = opts.agentKind ?? "claude";
   const [bin, args] = buildCommand(opts);
   const env = buildEnv(agentKind);
@@ -323,14 +328,21 @@ export function runAgent(opts: RunOptions): RunHandle {
   // is never delivered (lost SIGCHLD after sleep, wedged grandchild stdio).
   let forceSettle: ((exitCode: number) => void) | undefined;
   let killScheduled = false;
+  let postResultCleanup = false;
+  let postResultSucceeded = false;
   let terminationEscalated = false;
   let pendingExitCode: number | undefined;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let postKillTimer: ReturnType<typeof setTimeout> | undefined;
-  function doKill(): void {
+  function doKill(reason: "interrupted" | "post_result_cleanup" = "interrupted", resultSucceeded = false): void {
     if (killScheduled) return;
     killScheduled = true;
-    termination ??= "interrupted";
+    if (reason === "post_result_cleanup") {
+      postResultCleanup = true;
+      postResultSucceeded = resultSucceeded;
+    } else {
+      termination ??= "interrupted";
+    }
     signalProcess("SIGTERM");
     killTimer = setTimeout(() => {
       terminationEscalated = true;
@@ -343,21 +355,22 @@ export function runAgent(opts: RunOptions): RunHandle {
     }, SIGKILL_GRACE_MS);
     killTimer.unref();
   }
+  const abortProcess = (): void => doKill();
 
   // ── grandchild-block workaround: force-kill 30s after result ──────────────
   let grandchildGraceTimer: ReturnType<typeof setTimeout> | undefined;
-  function scheduleGrandchildGrace(): void {
+  function scheduleGrandchildGrace(resultSucceeded: boolean): void {
     if (grandchildGraceTimer !== undefined) return;
     grandchildGraceTimer = setTimeout(() => {
       grandchildGraceTimer = undefined;
       if (!child.killed && !killScheduled) {
         console.warn(
-          "[runner] claude still running 30s after result — likely a non-detached grandchild " +
+          `[runner] ${agentKind} still running after a terminal result — likely a non-detached grandchild ` +
             "(e.g. dev server) holding stdio. Sending SIGTERM.",
         );
-        doKill();
+        doKill("post_result_cleanup", resultSucceeded);
       }
-    }, GRANDCHILD_GRACE_MS);
+    }, postResultGraceMs);
     grandchildGraceTimer.unref();
   }
 
@@ -366,7 +379,7 @@ export function runAgent(opts: RunOptions): RunHandle {
 
   if (opts.abortSignal != null) {
     if (opts.abortSignal.aborted) doKill();
-    else opts.abortSignal.addEventListener("abort", doKill, { once: true });
+    else opts.abortSignal.addEventListener("abort", abortProcess, { once: true });
   }
 
   const stderrChunks: Buffer[] = [];
@@ -392,13 +405,17 @@ export function runAgent(opts: RunOptions): RunHandle {
       clearTimeout(postKillTimer);
       clearTimeout(grandchildGraceTimer);
       rlAbortController.abort();
-      opts.abortSignal?.removeEventListener("abort", doKill);
-      if (exitCode !== 0 && !killScheduled) {
+      opts.abortSignal?.removeEventListener("abort", abortProcess);
+      // Killing an otherwise successful, already-completed turn is transport
+      // cleanup, not a failed agent result. Preserve that logical success even
+      // though the OS reports a signal-derived non-zero/null exit code.
+      const resolvedExitCode = postResultCleanup && postResultSucceeded ? 0 : exitCode;
+      if (resolvedExitCode !== 0 && !killScheduled) {
         const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        reject(new Error(`${agentKind} exited with code ${exitCode}` + (stderr ? `\nstderr: ${stderr}` : "")));
+        reject(new Error(`${agentKind} exited with code ${resolvedExitCode}` + (stderr ? `\nstderr: ${stderr}` : "")));
         return;
       }
-      resolve({ exitCode, sessionId: discoveredSessionId, ...(termination ? { termination } : {}) });
+      resolve({ exitCode: resolvedExitCode, sessionId: discoveredSessionId, ...(termination ? { termination } : {}) });
     };
     // Let doKill force-settle `done` once the child is (presumed) dead but the
     // OS never delivered its exit/close — guarded by `settled`, so harmless if
@@ -413,7 +430,7 @@ export function runAgent(opts: RunOptions): RunHandle {
       clearTimeout(postKillTimer);
       rlAbortController.abort();
       clearTimeout(grandchildGraceTimer);
-      opts.abortSignal?.removeEventListener("abort", doKill);
+      opts.abortSignal?.removeEventListener("abort", abortProcess);
       if (err.code === "ENOENT") {
         reject(
           new Error(
@@ -458,7 +475,7 @@ export function runAgent(opts: RunOptions): RunHandle {
       for await (const line of rl) {
         for (const event of parseLinesMulti(line, agentKind)) {
           if (event.type === "system_init") discoveredSessionId = event.sessionId;
-          if (event.type === "result") scheduleGrandchildGrace();
+          if (event.type === "result") scheduleGrandchildGrace(!event.isError);
           yield event;
         }
       }
@@ -472,7 +489,7 @@ export function runAgent(opts: RunOptions): RunHandle {
     }
   }
 
-  return { events: generateEvents(), done, kill: doKill };
+  return { events: generateEvents(), done, kill: () => doKill() };
 }
 
 export function runClaude(opts: RunOptions): RunHandle {
