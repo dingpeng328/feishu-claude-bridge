@@ -107,4 +107,52 @@ describe("delivery recovery and connection retry", () => {
     expect(finalCardMatches(JSON.stringify(managedCardSpec("回复完成", "a*b", false)), managedCardSpec("回复完成", "ab", false))).toBe(false);
     expect(finalCardMatches(JSON.stringify(managedCardSpec("> ✅ **回复完成**", "完整正文尾部", true)), expected)).toBe(false);
   });
+
+  it("accepts a final card whose Markdown table is compiled by CardKit", () => {
+    const expected = managedCardSpec(
+      "> ✅ **回复完成**",
+      "| 公司 | 8月件量 |\n|---|---:|\n| 圆通 | **28.36亿** |",
+      false,
+    );
+    const compiled = JSON.stringify({
+      json_card: JSON.stringify({
+        schema: "2.0",
+        config: { streamingMode: false },
+        body: {
+          property: {
+            elements: [
+              {
+                id: "status_md",
+                tag: "markdown",
+                property: {
+                  elements: [{ tag: "plain_text", property: { content: "✅ 回复完成" } }],
+                },
+              },
+              {
+                id: "stream_md",
+                tag: "markdown",
+                property: {
+                  elements: [{
+                    tag: "table",
+                    property: {
+                      columns: [
+                        { name: "0", displayName: "公司" },
+                        { name: "1", displayName: "8月件量" },
+                      ],
+                      rows: [{
+                        0: { data: { tag: "markdown", property: { elements: [{ tag: "plain_text", property: { content: "圆通" } }] } } },
+                        1: { data: { tag: "markdown", property: { elements: [{ tag: "plain_text", property: { content: "28.36亿" } }] } } },
+                      }],
+                    },
+                  }],
+                },
+              },
+            ],
+          },
+        },
+      }),
+    });
+
+    expect(finalCardMatches(compiled, expected)).toBe(true);
+  });
 });

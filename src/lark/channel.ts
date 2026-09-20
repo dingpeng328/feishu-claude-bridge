@@ -287,6 +287,27 @@ function compiledCardText(value: unknown): string {
   const content = directString(record, "content") ?? directString(property, "content");
   if (content !== undefined) return content;
 
+  // CardKit compiles Markdown tables into a distinct `table` node rather than
+  // nested elements. Preserve its visible cells so delivery verification does
+  // not mistake a successfully rendered table for a truncated response.
+  const columns = property?.["columns"];
+  const rows = property?.["rows"];
+  if (tag === "table" && Array.isArray(columns) && Array.isArray(rows)) {
+    const tableColumns = columns
+      .map(directRecord)
+      .filter((column): column is Record<string, unknown> => column !== undefined);
+    const cell = (row: unknown, name: string): string => {
+      const rowRecord = directRecord(row);
+      const column = directRecord(rowRecord?.[name]);
+      return compiledCardText(column?.["data"]);
+    };
+    const header = tableColumns.map(column => directString(column, "displayName") ?? "");
+    const body = rows.map(row =>
+      tableColumns.map(column => cell(row, directString(column, "name") ?? "")).join(" | "),
+    );
+    return [`| ${header.join(" | ")} |`, ...body.map(row => `| ${row} |`)].join("\n");
+  }
+
   const elements = property?.["elements"] ?? record["elements"];
   if (Array.isArray(elements)) {
     const text = elements.map(compiledCardText).join("");
@@ -404,6 +425,7 @@ function visibleMarkdown(text: string): string {
   return normalizedCardText(text)
     .replace(/^\s*```[^\n]*$/gm, "")
     .replace(/^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+)/gm, "")
+    .replace(/^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/gm, "")
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/[*_`~]/g, "")
     .replace(/\s+/g, "");
