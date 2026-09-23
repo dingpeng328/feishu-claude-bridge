@@ -14,7 +14,7 @@ import type { LarkMessageEvent } from "./transport.js";
 import { AsyncQueue } from "./transport.js";
 import { extractMessageText } from "./message.js";
 import { INITIAL_STREAM_TEXT, type OutboundCardClient } from "./card.js";
-import { ManagedMarkdownStream, managedCardSpec, splitManagedMarkdown, type ManagedCardTransport } from "./cardStream.js";
+import { CardKitError, ManagedMarkdownStream, managedCardSpec, splitManagedMarkdown, type ManagedCardTransport } from "./cardStream.js";
 import { DeliveryState } from "./deliveryState.js";
 import { TurnJournal } from "./turnJournal.js";
 
@@ -70,6 +70,12 @@ interface LarkChannel {
   rawClient: {
     cardkit: {
       v1: {
+        card: {
+          settings(payload: {
+            path: { card_id: string };
+            data: { settings: string; sequence: number; uuid: string };
+          }): Promise<{ code?: number; msg?: string } | void>;
+        };
         cardElement: {
           content(payload: {
             path: { card_id: string; element_id: string };
@@ -1344,7 +1350,25 @@ export class ChannelClient {
           `update CardKit element ${cardId}/${elementId}`,
         );
         if (res && res.code && res.code !== 0) {
-          throw new Error(`${res.code}: ${res.msg ?? "cardElement.content failed"}`);
+          throw new CardKitError(res.code, res.msg ?? "cardElement.content failed");
+        }
+      },
+      async reopenStreaming(cardId, sequence) {
+        await client.journal?.reserveSequence(turnId, cardId, sequence);
+        const res = await withTimeout(
+          getChannel().rawClient.cardkit.v1.card.settings({
+            path: { card_id: cardId },
+            data: {
+              settings: JSON.stringify({ config: { streaming_mode: true } }),
+              sequence,
+              uuid: `c_${cardId}_${sequence}`,
+            },
+          }),
+          SDK_TIMEOUT_MS,
+          `reopen CardKit stream ${cardId}`,
+        );
+        if (res && res.code && res.code !== 0) {
+          throw new CardKitError(res.code, res.msg ?? "card.settings failed");
         }
       },
       async updateCard(cardId, card, sequence) {

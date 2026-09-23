@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   BODY_ELEMENT_ID,
+  CardKitError,
   ManagedMarkdownStream,
   STATUS_ELEMENT_ID,
   splitManagedMarkdown,
@@ -14,6 +15,7 @@ function makeTransport() {
     createCard: vi.fn(async () => ({ cardId: `card_${++cardSequence}` })),
     sendCard: vi.fn(async () => ({ messageId: `message_${++messageSequence}` })),
     updateElement: vi.fn(async () => undefined),
+    reopenStreaming: vi.fn(async () => undefined),
     updateCard: vi.fn(async () => undefined),
   };
   return transport;
@@ -30,6 +32,81 @@ function cardBodyContents(card: object): string[] {
 }
 
 describe("ManagedMarkdownStream", () => {
+  it.each([
+    new CardKitError(300309, "streaming mode is closed"),
+    new CardKitError(200850, "Card streaming timeout"),
+    { response: { data: { code: 300309 } } },
+  ])("reopens the active original card and retries a closed stream: %j", async (error) => {
+    const transport = makeTransport();
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    await stream.setContent("已有正文");
+    vi.mocked(transport.updateElement).mockRejectedValueOnce(error);
+
+    await stream.setStatus("等待工具完成");
+    expect(transport.reopenStreaming).toHaveBeenCalledExactlyOnceWith("card_1", 3);
+    expect(transport.updateElement).toHaveBeenLastCalledWith("card_1", STATUS_ELEMENT_ID, "等待工具完成", 4);
+    await stream.setContent("已有正文及后续内容");
+    expect(transport.updateElement).toHaveBeenLastCalledWith("card_1", BODY_ELEMENT_ID, "\u200b已有正文及后续内容", 5);
+    expect(transport.createCard).toHaveBeenCalledTimes(1);
+    expect(transport.sendCard).toHaveBeenCalledTimes(1);
+    expect(transport.updateCard).not.toHaveBeenCalled();
+
+    stream.setFinalContent("回复完成", "最终正文");
+    await stream.complete();
+    expect(cardBodyContents(vi.mocked(transport.updateCard).mock.calls[0]![1])).toEqual(["回复完成", "最终正文"]);
+    await stream.setStatus("迟到的状态");
+    await stream.setContent("已有正文及后续内容和迟到输出");
+    expect(transport.updateElement).toHaveBeenCalledTimes(4);
+    expect(transport.reopenStreaming).toHaveBeenCalledTimes(1);
+  });
+
+  it("reopens only the active continuation when its body stream expires", async () => {
+    const transport = makeTransport();
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    const prefix = "x".repeat(31_000);
+    await stream.setContent(prefix);
+    vi.mocked(transport.updateElement).mockRejectedValueOnce(new CardKitError(300309, "closed"));
+    await stream.setContent(`${prefix}后续`);
+    expect(transport.reopenStreaming).toHaveBeenCalledExactlyOnceWith("card_2", 2);
+    expect(transport.updateElement).toHaveBeenLastCalledWith("card_2", BODY_ELEMENT_ID, `${"x".repeat(2_001)}后续`, 3);
+    expect(transport.sendCard).toHaveBeenCalledTimes(2);
+    await stream.complete();
+    expect(vi.mocked(transport.updateCard).mock.calls.slice(-2).every(([, card]) => !cardConfig(card)?.streaming_mode)).toBe(true);
+  });
+
+  it.each([new Error("network unavailable"), new CardKitError(300311, "permission denied")])("does not reopen for unrelated failures: %j", async (error) => {
+    const transport = makeTransport();
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    vi.mocked(transport.updateElement).mockRejectedValueOnce(error);
+    await expect(stream.setContent("正文")).rejects.toBe(error);
+    expect(transport.reopenStreaming).not.toHaveBeenCalled();
+  });
+
+  it("surfaces renewal failures and allows the same status to be retried", async () => {
+    const transport = makeTransport();
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    vi.mocked(transport.updateElement).mockRejectedValue(new CardKitError(300309, "closed"));
+    vi.mocked(transport.reopenStreaming).mockRejectedValueOnce(new Error("renewal unavailable"));
+    await expect(stream.setStatus("等待工具完成")).rejects.toThrow("renewal unavailable");
+    expect(transport.updateElement).toHaveBeenCalledTimes(1);
+
+    vi.mocked(transport.updateElement).mockResolvedValueOnce(undefined);
+    await stream.setStatus("等待工具完成");
+    expect(transport.updateElement).toHaveBeenLastCalledWith("card_1", STATUS_ELEMENT_ID, "等待工具完成", 3);
+  });
+
+  it("retries only once when the renewed stream is still closed and preserves final delivery", async () => {
+    const transport = makeTransport();
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    vi.mocked(transport.updateElement).mockRejectedValue(new CardKitError(200850, "timeout"));
+    await expect(stream.setContent("正文")).rejects.toThrow("timeout");
+    expect(transport.reopenStreaming).toHaveBeenCalledTimes(1);
+    expect(transport.updateElement).toHaveBeenCalledTimes(2);
+    stream.setFinalContent("回复完成", "正文");
+    await stream.complete();
+    expect(cardBodyContents(vi.mocked(transport.updateCard).mock.calls[0]![1])).toEqual(["回复完成", "正文"]);
+  });
+
   it("retains final text and stops creating replies after a send acknowledgement is lost", async () => {
     const transport = makeTransport();
     transport.saveFinalContent = vi.fn(async () => undefined);

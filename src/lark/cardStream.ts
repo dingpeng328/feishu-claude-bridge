@@ -6,6 +6,21 @@ export const BODY_ELEMENT_ID = "stream_md";
 const BODY_STREAM_PREFIX = "\u200b";
 const BODY_CHUNK_MAX_CHARS = 29_000;
 
+export class CardKitError extends Error {
+  constructor(readonly code: number, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "CardKitError";
+  }
+}
+
+function isStreamingClosed(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  // The SDK can either return an API response or reject with an HTTP error.
+  const apiError = error as { code?: unknown; response?: { data?: { code?: unknown } } };
+  const code = apiError.response?.data?.code ?? apiError.code;
+  return code === 300309 || code === 200850;
+}
+
 export interface ManagedCardTransport {
   createCard(card: object): Promise<{ cardId: string }>;
   sendCard(
@@ -20,6 +35,7 @@ export interface ManagedCardTransport {
     content: string,
     sequence: number,
   ): Promise<void>;
+  reopenStreaming(cardId: string, sequence: number): Promise<void>;
   updateCard(cardId: string, card: object, sequence: number): Promise<void>;
   saveFinal?(plans: Array<{ cardId: string; card: object }>): Promise<void>;
   saveFinalContent?(status: string, body: string): Promise<void>;
@@ -161,9 +177,11 @@ export class ManagedMarkdownStream implements MarkdownStreamController {
 
   private readonly segments: CardSegment[];
   private statusContent: string;
+  private deliveredStatus: string;
   private fullBody = "";
   private finalContent: { status: string; body: string } | undefined;
   private deliveryUncertain = false;
+  private completed = false;
 
   private constructor(
     private readonly transport: ManagedCardTransport,
@@ -175,25 +193,23 @@ export class ManagedMarkdownStream implements MarkdownStreamController {
   ) {
     this.messageId = firstSegment.messageId;
     this.statusContent = initialStatus;
+    this.deliveredStatus = initialStatus;
     this.segments = [firstSegment];
   }
 
   async setStatus(fullContent: string): Promise<void> {
-    if (!fullContent || fullContent === this.statusContent) return;
+    if (this.completed || !fullContent) return;
     // Retain the newest intended status even when the live element update
     // fails; complete() can still recover it with a whole-card update.
     this.statusContent = fullContent;
+    if (fullContent === this.deliveredStatus) return;
     const active = this.activeSegment();
-    await this.transport.updateElement(
-      active.cardId,
-      STATUS_ELEMENT_ID,
-      fullContent,
-      this.nextSequence(active),
-    );
+    await this.updateLiveElement(active, STATUS_ELEMENT_ID, fullContent);
+    this.deliveredStatus = fullContent;
   }
 
   async setContent(fullContent: string): Promise<void> {
-    if (this.deliveryUncertain) return;
+    if (this.completed || this.deliveryUncertain) return;
     const nextBody = fullContent ?? "";
     if (nextBody === this.fullBody) return;
 
@@ -256,11 +272,13 @@ export class ManagedMarkdownStream implements MarkdownStreamController {
         bodyContent: chunk,
         streaming,
       });
+      this.deliveredStatus = this.statusContent;
     }
     this.fullBody = nextBody;
   }
 
   async complete(): Promise<void> {
+    this.completed = true;
     if (this.finalContent) {
       await this.commitFinal();
       return;
@@ -355,13 +373,25 @@ export class ManagedMarkdownStream implements MarkdownStreamController {
   }
 
   private async updateBody(segment: CardSegment, content: string): Promise<void> {
-    await this.transport.updateElement(
-      segment.cardId,
-      BODY_ELEMENT_ID,
-      content,
-      this.nextSequence(segment),
-    );
+    await this.updateLiveElement(segment, BODY_ELEMENT_ID, content);
     segment.bodyContent = content;
+  }
+
+  private async updateLiveElement(segment: CardSegment, elementId: string, content: string): Promise<void> {
+    const update = () => this.transport.updateElement(
+      segment.cardId, elementId, content, this.nextSequence(segment),
+    );
+    try {
+      await update();
+    } catch (err) {
+      if (!segment.streaming || !isStreamingClosed(err)) throw err;
+      // Feishu closes streaming mode ten minutes after it was enabled.
+      // Reopen only the original live card's settings so its existing body
+      // stays intact. Both renewal and retry share the card's sequence.
+      await this.transport.reopenStreaming(segment.cardId, this.nextSequence(segment));
+      await update(); // One retry only; genuine failures still reach the renderer.
+      console.log(`[card] streaming resumed message_id=${segment.messageId}`);
+    }
   }
 
   private async updateWholeCard(segment: CardSegment, streaming: boolean): Promise<void> {
