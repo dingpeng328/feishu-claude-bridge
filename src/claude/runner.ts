@@ -49,6 +49,8 @@ export interface RunOptions {
   /** @default 30 seconds; injectable for lifecycle tests. */
   postResultGraceMs?: number;
   abortSignal?: AbortSignal;
+  /** Optional local execution-history sink. */
+  onStderr?: (text: string) => void;
   /** Codex-only execution policy. Omitted preserves the legacy bypass behavior. */
   codexExecutionPolicy?: CodexExecutionPolicy;
   /** @default depends on agentKind */
@@ -387,7 +389,10 @@ export function runAgent(opts: RunOptions): RunHandle {
   }
 
   const stderrChunks: Buffer[] = [];
-  child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrChunks.push(chunk);
+    opts.onStderr?.(chunk.toString("utf8"));
+  });
 
   // AbortController forcibly closes readline so the events loop unblocks even
   // when child.stdout hasn't drained (grandchild holding the pipe).

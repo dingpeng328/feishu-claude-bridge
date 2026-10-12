@@ -14,6 +14,7 @@ import { CardRenderer } from "./lark/card.js";
 import { SessionStore } from "./claude/sessionStore.js";
 import { BridgeHandler } from "./bridge/handler.js";
 import { installPersistentLogging } from "./logger.js";
+import { HistoryStore } from "./history/store.js";
 
 const VERSION = "0.1.0";
 
@@ -111,6 +112,7 @@ async function main(): Promise<void> {
     outbound: client.outboundCardClient(),
   });
   const handler = new BridgeHandler({
+    history: new HistoryStore(path.join(path.dirname(config.sessionsPath), "history")),
     client,
     cardRenderer,
     sessionStore,
@@ -147,6 +149,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   console.log("[feishu-claude-bridge] listening for @-mentions…\n");
+  console.log("[history] 本地过程查看器：npm run history（默认 http://127.0.0.1:8765）");
   await handler.run();
 }
 

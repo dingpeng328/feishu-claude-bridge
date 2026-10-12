@@ -1,6 +1,8 @@
 import { mkdir } from "node:fs/promises";
 import type { SessionStore, SessionRecord } from "../claude/sessionStore.js";
 import { runAgent, type RunHandle, type RunOptions } from "../claude/runner.js";
+import { runTrackedAgent } from "../history/trackedRunner.js";
+import type { HistoryStore } from "../history/store.js";
 import type { WechatConfig } from "./config.js";
 import type { WechatInboundEvent, WechatMessageClient } from "./client.js";
 
@@ -16,6 +18,7 @@ export interface WechatHandlerDeps {
   sessionStore: SessionStore;
   config: WechatConfig;
   runAgentFn?: AgentRunner;
+  history?: HistoryStore;
 }
 
 export function parseWechatCommand(text: string): WechatCommand {
@@ -167,7 +170,7 @@ export class WechatHandler {
           isNewSession: existing === undefined,
           config: this.#deps.config,
         });
-        const handle = this.#runAgent({
+        const handle = runTrackedAgent({
           agentKind: "codex",
           agentBinPath: this.#deps.config.agentBin,
           prompt,
@@ -180,7 +183,9 @@ export class WechatHandler {
             sandbox: this.#deps.config.codexSandbox,
             approveForMe: this.#deps.config.codexApproveForMe,
           },
-        });
+        }, this.#deps.history, {
+          platform: "wechat", conversationId: key, title: event.text.slice(0, 200),
+        }, this.#runAgent);
         let sessionId: string | undefined;
         try {
           for await (const agentEvent of handle.events) {

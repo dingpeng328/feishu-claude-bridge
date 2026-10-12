@@ -4,6 +4,7 @@ import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { SessionStore } from "./claude/sessionStore.js";
 import { installPersistentLogging } from "./logger.js";
+import { HistoryStore } from "./history/store.js";
 import { ensureWechatCredentials } from "./wechat/auth.js";
 import { WechatClient } from "./wechat/client.js";
 import { loadWechatConfig } from "./wechat/config.js";
@@ -77,7 +78,8 @@ async function main(): Promise<void> {
   const delivery = await WechatDeliveryState.load(config.deliveryPath);
   const sessions = await SessionStore.load(config.sessionsPath, { discardExisting: true });
   const client = new WechatClient({ config, credentials, delivery });
-  const handler = new WechatHandler({ client, sessionStore: sessions, config });
+  const handler = new WechatHandler({ client, sessionStore: sessions, config,
+    history: new HistoryStore(path.join(config.stateDir, "history")) });
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -98,6 +100,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   console.log("[wechat-codex-bridge] 正在监听微信消息…");
+  console.log("[history] 本地过程查看器：npm run history（默认 http://127.0.0.1:8765）");
   try {
     await handler.run();
   } finally {

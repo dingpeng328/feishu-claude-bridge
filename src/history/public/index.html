@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Bridge · 会话与执行记录</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><div class="brand"><span class="logo">B</span><div><strong>Bridge <span class="muted">/ 执行记录</span></strong><small>本地会话 · 过程可追溯</small></div></div><span id="connection" role="status">正在连接…</span></header>
+<div id="error" role="alert" hidden></div>
+<div class="layout">
+<aside><div class="side-head"><h2>历史会话 <span id="count">0</span></h2><input id="search" type="search" aria-label="搜索会话" placeholder="搜索消息、会话 ID…"><select id="platform" aria-label="平台"><option value="">所有平台</option><option value="feishu">飞书</option><option value="wechat">微信</option></select></div><div id="conversations"></div><button id="more-conversations" class="more" hidden>加载更多会话</button><p class="footnote">记录从新版 bridge 启动后开始保存。查看器每 1.2 秒读取新增事件。</p></aside>
+<main><section id="welcome" class="empty"><div class="empty-icon">↗</div><h1>每一步，都有迹可循</h1><p>选择左侧会话，查看消息、工具调用和执行结果。</p><p class="muted">暂无记录时，请先重启新版 bridge，再发送一条消息。<br>历史查看器可以独立运行，已有记录会一直保留。</p></section>
+<section id="detail" hidden><div class="detail-head"><div class="eyebrow" id="source"></div><h1 id="title"></h1><p id="conversation-id" class="muted mono"></p><label class="run-label">执行轮次 <select id="runs" aria-label="执行轮次"></select></label><button id="more-runs" class="more" hidden>加载更早轮次</button><div id="run-meta" class="meta"></div></div>
+<div class="toolbar"><nav aria-label="事件筛选"><button data-filter="all" class="active">过程</button><button data-filter="text">输出</button><button data-filter="tool">工具</button><button data-filter="error">错误</button><button data-filter="raw">原始事件</button></nav><label><input id="follow" type="checkbox" checked> 跟随输出</label></div>
+<div id="timeline"></div><p id="event-empty" class="empty-small">等待执行事件…</p></section></main>
+</div></body></html>

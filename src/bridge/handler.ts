@@ -19,7 +19,9 @@ import type { CardRenderer, CardHandle } from "../lark/card.js";
 import type { SessionStore } from "../claude/sessionStore.js";
 import { parseMessage, sessionKeyOf } from "../lark/message.js";
 import { renderPrompt } from "../claude/prompt.js";
-import { runAgent, type AgentKind } from "../claude/runner.js";
+import { type AgentKind } from "../claude/runner.js";
+import { runTrackedAgent } from "../history/trackedRunner.js";
+import type { HistoryStore } from "../history/store.js";
 
 const MAX_CONCURRENT = 5;
 
@@ -27,6 +29,7 @@ export interface BridgeHandlerDeps {
   client: ChannelClient;
   cardRenderer: CardRenderer;
   sessionStore: SessionStore;
+  history?: HistoryStore;
   /** Shared cwd the agent subprocess runs in (same for all topics). */
   workDir: string;
   agentKind: AgentKind;
@@ -267,7 +270,7 @@ export class BridgeHandler {
           threadContext,
         });
 
-        const handle = runAgent({
+        const handle = runTrackedAgent({
           agentKind: this.deps.agentKind,
           prompt,
           resumeSessionId: currentExisting?.sessionId,
@@ -276,6 +279,8 @@ export class BridgeHandler {
           agentBinPath: this.deps.agentBin,
           model: this.deps.agentModel,
           abortSignal: signal, // interrupt → SIGTERM the agent subprocess
+        }, this.deps.history, {
+          platform: "feishu", conversationId: threadId, messageId, title: parsed.text.slice(0, 200),
         });
 
         let sessionId: string | undefined;

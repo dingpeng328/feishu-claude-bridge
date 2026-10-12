@@ -9,6 +9,7 @@
     "start:feishu": "tsx src/main.ts",
     "start:wechat": "tsx src/wechat-main.ts",
     "dev": "tsx watch src/main.ts",
+    "history": "tsx src/history-main.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
