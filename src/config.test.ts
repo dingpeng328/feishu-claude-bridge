@@ -9,6 +9,7 @@ const ENV_KEYS = [
   "WORK_DIR",
   "AGENT_KIND",
   "AGENT_BIN",
+  "AGENT_MODEL",
   "AGENT_SYSTEM_PROMPT",
   "CLAUDE_BIN",
   "SUBPROCESS_TIMEOUT_MS",
@@ -32,6 +33,23 @@ function setMinimalEnv(): void {
 }
 
 describe("loadConfig", () => {
+  it("uses CLI defaults unless a bridge model is configured", () => {
+    setMinimalEnv();
+    expect(loadConfig().agentModel).toBeUndefined();
+    process.env.AGENT_MODEL = "  bridge-model  ";
+    expect(loadConfig().agentModel).toBe("bridge-model");
+    expect(loadConfig(["--model", "startup-model"]).agentModel).toBe("startup-model");
+    expect(loadConfig(["-m", "startup-model"]).agentModel).toBe("startup-model");
+    process.env.AGENT_MODEL = "   ";
+    expect(loadConfig().agentModel).toBeUndefined();
+  });
+
+  it("rejects missing or empty startup model arguments", () => {
+    setMinimalEnv();
+    expect(() => loadConfig(["--model"])).toThrow();
+    expect(() => loadConfig(["--model", "   "])).toThrow("non-empty model name");
+  });
+
   it("infers codex when AGENT_BIN points at codex", () => {
     setMinimalEnv();
     process.env.AGENT_BIN = "codex";

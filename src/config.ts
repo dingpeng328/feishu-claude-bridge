@@ -8,6 +8,7 @@
 
 import os from "node:os";
 import path from "node:path";
+import { parseArgs } from "node:util";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 import { DEFAULT_AGENT_SYSTEM_PROMPT } from "./claude/prompt.js";
@@ -28,6 +29,7 @@ const EnvSchema = z.object({
   WORK_DIR: z.string().optional(),
   AGENT_KIND: z.enum(["claude", "codex"]).optional(),
   AGENT_BIN: z.string().optional(),
+  AGENT_MODEL: z.string().optional(),
   AGENT_SYSTEM_PROMPT: z.string().optional(),
   CLAUDE_BIN: z.string().optional(),
   SUBPROCESS_TIMEOUT_MS: z.string().optional(),
@@ -52,6 +54,8 @@ export interface Config {
   logPath: string;
   agentKind: "claude" | "codex";
   agentBin: string;
+  /** Optional per-bridge model override; omitted uses the CLI default. */
+  agentModel?: string;
   /** Role/behavior instructions prepended when a new agent session starts. */
   agentSystemPrompt: string;
   subprocessTimeoutMs: number;
@@ -61,7 +65,14 @@ export interface Config {
  * Parse + validate process.env into a typed Config. Throws a readable error
  * (collected zod issues) when a required field is missing — main.ts surfaces it.
  */
-export function loadConfig(): Config {
+export function loadConfig(args: string[] = []): Config {
+  const { values } = parseArgs({
+    args,
+    options: { model: { type: "string", short: "m" } },
+  });
+  if (values.model !== undefined && !values.model.trim()) {
+    throw new Error("--model requires a non-empty model name.");
+  }
   const parsed = EnvSchema.safeParse(process.env);
   if (!parsed.success) {
     const issues = parsed.error.issues
@@ -109,6 +120,7 @@ export function loadConfig(): Config {
     logPath: path.join(HOME_DIR, "bridge.log"),
     agentKind: inferredAgentKind,
     agentBin: configuredAgentBin ?? (inferredAgentKind === "codex" ? "codex" : "claude"),
+    agentModel: (values.model ?? env.AGENT_MODEL)?.trim() || undefined,
     agentSystemPrompt:
       env.AGENT_SYSTEM_PROMPT === undefined
         ? DEFAULT_AGENT_SYSTEM_PROMPT

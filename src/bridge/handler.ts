@@ -31,6 +31,7 @@ export interface BridgeHandlerDeps {
   workDir: string;
   agentKind: AgentKind;
   agentBin: string;
+  agentModel?: string;
   /** Role/behavior instructions for newly-created agent sessions. */
   agentSystemPrompt: string;
   subprocessTimeoutMs: number;
@@ -273,6 +274,7 @@ export class BridgeHandler {
           cwd,
           timeoutMs: this.deps.subprocessTimeoutMs,
           agentBinPath: this.deps.agentBin,
+          model: this.deps.agentModel,
           abortSignal: signal, // interrupt → SIGTERM the agent subprocess
         });
 

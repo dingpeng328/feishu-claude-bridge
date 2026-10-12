@@ -65,7 +65,7 @@ function checkAgent(bin: string): string | null {
 async function main(): Promise<void> {
   let config;
   try {
-    config = loadConfig();
+    config = loadConfig(process.argv.slice(2));
   } catch (err) {
     console.error(`[feishu-claude-bridge] ${(err as Error).message}`);
     process.exit(1);
@@ -86,6 +86,7 @@ async function main(): Promise<void> {
   } else {
     console.warn(`  agent      ✗  (未找到 "${config.agentBin}" — 装好 ${config.agentKind} CLI 并确保在 PATH,或设 AGENT_BIN)`);
   }
+  console.log(`  model       ${config.agentModel ?? "(CLI 默认配置)"}`);
   console.log(`  work dir    ${config.workDir}`);
   console.log(`  sessions    ${config.sessionsPath}`);
   console.log(`  delivery    ${config.deliveryPath}`);
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
     workDir: config.workDir,
     agentKind: config.agentKind,
     agentBin: config.agentBin,
+    agentModel: config.agentModel,
     agentSystemPrompt: config.agentSystemPrompt,
     subprocessTimeoutMs: config.subprocessTimeoutMs,
   });

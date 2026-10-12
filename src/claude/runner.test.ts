@@ -180,6 +180,17 @@ describe("codex support", () => {
     ]);
   });
 
+  it.each(["claude", "codex"] as const)("passes a model override to new and resumed %s sessions", (agentKind) => {
+    for (const resumeSessionId of [undefined, "thread_1"]) {
+      const [, args] = _buildCommand({ agentKind, prompt: "hi", model: "bridge-model", resumeSessionId });
+      const modelIndex = args.indexOf("--model");
+      expect(modelIndex).toBeGreaterThanOrEqual(0);
+      expect(args[modelIndex + 1]).toBe("bridge-model");
+      expect(args.at(-1)).toBe("hi");
+      if (resumeSessionId) expect(args).toContain(resumeSessionId);
+    }
+  });
+
   it("builds sandboxed codex commands for an unattended channel", () => {
     const policy = { mode: "sandbox", sandbox: "workspace-write", approveForMe: true } as const;
     expect(_buildCommand({ agentKind: "codex", prompt: "hi", codexExecutionPolicy: policy })).toEqual([

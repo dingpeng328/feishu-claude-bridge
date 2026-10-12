@@ -36,6 +36,8 @@ export type AgentStreamEvent =
 export interface RunOptions {
   /** @default 'claude' */
   agentKind?: AgentKind;
+  /** Explicit model for both new and resumed sessions; omitted uses CLI config. */
+  model?: string;
   prompt: string;
   resumeSessionId?: string;
   /** @default 'bypassPermissions' */
@@ -90,6 +92,7 @@ function buildCommand(opts: RunOptions): [string, string[]] {
     "--verbose",
     "--include-partial-messages",
   ];
+  if (opts.model?.trim()) args.push("--model", opts.model.trim());
   if (opts.resumeSessionId != null) args.push("--resume", opts.resumeSessionId);
   args.push("-p", opts.prompt);
   return [bin, args];
@@ -113,6 +116,7 @@ function buildCodexCommand(opts: RunOptions): [string, string[]] {
     args.push("exec", "--sandbox", policy.sandbox);
   }
   const execArgs = ["--json", "--skip-git-repo-check"];
+  if (opts.model?.trim()) execArgs.push("--model", opts.model.trim());
   if (opts.resumeSessionId != null) {
     args.push("resume", ...execArgs, opts.resumeSessionId, opts.prompt);
   } else {

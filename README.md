@@ -154,12 +154,23 @@ bridge 有三层丢消息保护：官方 SDK 负责底层 ping/pong，并以 15 
 | `WORK_DIR` | | agent 运行的工作目录(所有话题共享）。留空=`~/.feishu-claude-bridge/work`（干净 scratch）；设成某仓库=机器人可读该仓库代码 / 用其 skill。sessions/delivery/log/pid 始终在 `~/.feishu-claude-bridge/`，不污染此目录 |
 | `AGENT_KIND` | | `claude` 或 `codex`，默认 `claude`；当前推荐设为 `codex` |
 | `AGENT_BIN` | | agent 路径；`AGENT_KIND=claude` 默认 `claude`，`AGENT_KIND=codex` 默认 `codex` |
+| `AGENT_MODEL` | | 飞书桥接的启动模型，支持 Claude/Codex；新建和续接会话均传入 `--model`。留空使用 CLI 默认配置；请填写当前登录账号支持的模型名 |
 | `AGENT_SYSTEM_PROMPT` | | 新 Agent 会话的角色/行为提示词；未配置时使用内置默认值。`.env` 双引号内可用 `\n` 表示多行；空字符串可关闭 |
 | `CLAUDE_BIN` | | 旧配置兼容项；未设置 `AGENT_BIN` 时仍生效 |
 | `SUBPROCESS_TIMEOUT_MS` | | 单轮超时，默认 30 分钟 |
 | `FCB_CHANNEL_REFRESH_MS` | | WS 主动刷新周期，默认 1200000（20 分钟）；`0` 关闭 |
 | `FCB_CATCHUP_INTERVAL_MS` | | 遗漏 @ 补拉周期，默认 60000（1 分钟）；`0` 关闭 |
 | `FCB_CATCHUP_LOOKBACK_MS` | | 首次启用补拉的回看窗口，默认 300000（5 分钟） |
+
+也可以在启动时指定模型，优先级为 `--model`（或 `-m`）> `AGENT_MODEL`（环境变量优先于 `.env`）> CLI 默认配置：
+
+```bash
+bash bin/start-feishu.sh --model <模型名>
+# npm 入口同样支持：
+npm run start:feishu -- --model <模型名>
+```
+
+启动日志会显示所选模型。修改 `.env` 后需重启飞书桥接生效；此配置不会修改全局 CLI 配置。
 
 `AGENT_SYSTEM_PROMPT` 的内置默认值是：
 

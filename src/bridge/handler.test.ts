@@ -103,6 +103,31 @@ function makeHandler(deps: ReturnType<typeof makeDeps>) {
 }
 
 describe("BridgeHandler.handleOne", () => {
+  it("passes the startup model to the runner for new and resumed topics", async () => {
+    for (const sessionId of [undefined, "sess_existing"]) {
+      if (sessionId) await store.put({ threadId: "om_top", sessionId, createdTs: 1, lastActiveTs: 1 });
+      const deps = makeDeps([topEvent("test")]);
+      runAgentMock.mockReturnValue(fakeRun([]));
+      const handler = new BridgeHandler({
+        client: deps.client as never,
+        cardRenderer: deps.cardRenderer as never,
+        sessionStore: store,
+        workDir,
+        agentKind: "codex",
+        agentBin: "codex",
+        agentModel: "bridge-model",
+        agentSystemPrompt: "测试助手提示词",
+        subprocessTimeoutMs: 1000,
+      });
+      await handler.run();
+      await waitFor(() => deps.card.finalizeArgs !== undefined);
+      expect(runAgentMock).toHaveBeenLastCalledWith(expect.objectContaining({
+        model: "bridge-model",
+        resumeSessionId: sessionId,
+      }));
+    }
+  });
+
   it("does not re-execute the agent when final delivery fails", async () => {
     runAgentMock.mockReturnValue(fakeRun([{ type: "text_delta", text: "已经执行成功", raw: {} }]));
     const deps = makeDeps([topEvent("test")]);
