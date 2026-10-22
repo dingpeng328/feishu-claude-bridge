@@ -4,6 +4,7 @@ import {
   CardKitError,
   ManagedMarkdownStream,
   STATUS_ELEMENT_ID,
+  normalizeCardMarkdown,
   splitManagedMarkdown,
   type ManagedCardTransport,
 } from "./cardStream.js";
@@ -32,6 +33,44 @@ function cardBodyContents(card: object): string[] {
 }
 
 describe("ManagedMarkdownStream", () => {
+  it("lifts list-nested code and tables in final cards while retaining the original journal text", async () => {
+    const transport = makeTransport();
+    transport.saveFinalContent = vi.fn(async () => undefined);
+    const stream = await ManagedMarkdownStream.start({ transport, chatId: "chat", replyToMessageId: "user", replyInThread: true, initialStatus: "处理中" });
+    const body = "1. 发放规则\n\n   ```text\n   if eligible:\n       grant(20000)\n   ```\n\n2. 场景\n\n   | 场景 | 额度 |\n   |---|---:|\n   | 发布 | 20,000 |\n\n   保留余额。";
+    await stream.setContent(body);
+    expect(transport.updateElement).toHaveBeenLastCalledWith("card_1", BODY_ELEMENT_ID, `\u200b${body}`, 1);
+    stream.setFinalContent("回复完成", body);
+    await stream.complete();
+    expect(transport.saveFinalContent).toHaveBeenCalledWith("回复完成", body);
+    const delivered = cardBodyContents(vi.mocked(transport.updateCard).mock.calls.at(-1)![1])[1];
+    expect(delivered).toBe("1. 发放规则\n\n```text\nif eligible:\n    grant(20000)\n```\n\n2. 场景\n\n| 场景 | 额度 |\n|---|---:|\n| 发布 | 20,000 |\n\n   保留余额。");
+    expect(normalizeCardMarkdown(delivered!)).toBe(delivered);
+    expect(transport.sendCard).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves top-level code and table-like literals inside nested fences", () => {
+    const code = "```python\nif ready:\n    run()\n```";
+    expect(normalizeCardMarkdown(code)).toBe(code);
+    const nested = "1. Example\n    ````md\n    ```python\n    if ready:\n        run()\n    ```\n      | literal |\n      |---|\n    ````\n2. Next";
+    expect(normalizeCardMarkdown(nested)).toBe("1. Example\n\n````md\n```python\nif ready:\n    run()\n```\n  | literal |\n  |---|\n````\n\n2. Next");
+  });
+
+  it("normalizes nested fences before splitting long final answers", () => {
+    const chunks = splitManagedMarkdown(`1. Code\n\n   \`\`\`ts\n${"   const x = 1;\n".repeat(12)}   \`\`\``, 80);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks[0]).toMatch(/\n```$/);
+    expect(chunks[1]).toMatch(/^```ts\n/);
+    expect(chunks.join("\n").match(/const x = 1;/g)).toHaveLength(12);
+  });
+
+  it("keeps parent paragraphs after their sublists without changing child paragraph indentation", () => {
+    const body = "1. **规则**\n\n   先判断：\n\n   - 免费\n\n     子项说明\n\n   - 付费\n\n   最后汇总。\n   保留顺序。\n\n2. 下一项";
+    const normalized = "1. **规则**\n\n   先判断：\n\n   - 免费\n\n     子项说明\n\n   - 付费\n\n最后汇总。\n保留顺序。\n\n2. 下一项";
+    expect(normalizeCardMarkdown(body)).toBe(normalized);
+    expect(normalizeCardMarkdown(normalized)).toBe(normalized);
+  });
+
   it.each([
     new CardKitError(300309, "streaming mode is closed"),
     new CardKitError(200850, "Card streaming timeout"),

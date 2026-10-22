@@ -86,8 +86,9 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[wechat-codex-bridge] ${signal} — shutting down…`);
-    await client.close();
-    await handler.close();
+    // Interrupt work immediately; a slow notifystop request must not give
+    // queued tasks another ten seconds to start during shutdown.
+    await Promise.all([client.close(), handler.close()]);
     await client.flush();
     await sessions.close();
     try {

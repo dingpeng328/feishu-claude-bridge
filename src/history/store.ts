@@ -26,7 +26,7 @@ export interface HistoryEvent {
   [key: string]: unknown;
 }
 const ID = /^[a-f0-9-]{36}$/;
-const SENSITIVE = /^(?:authorization|cookie|password|passwd|api[_-]?key|app[_-]?secret|(?:access|refresh|bot|context)[_-]?token)$/i;
+const SENSITIVE = /^(?:authorization|cookie|(?:\w+[_-])?(?:password|passwd|api[_-]?key|app[_-]?secret|(?:access|refresh|bot|context)[_-]?token))$/i;
 
 function sanitize(value: unknown, key = ""): unknown {
   if (SENSITIVE.test(key)) return "<redacted>";

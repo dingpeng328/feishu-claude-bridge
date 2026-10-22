@@ -42,6 +42,7 @@ async function harness() {
 
 describe("delivery recovery and connection retry", () => {
   it("retries the original persisted final card after a failed delivery without sending another reply", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const h = await harness();
     const final = managedCardSpec("> ✅ **回复完成**", "complete answer", false);
     await h.journal.recordCard("user", "entity", "reply");
@@ -50,10 +51,52 @@ describe("delivery recovery and connection retry", () => {
     await h.internal.recoverDeliveries();
     expect((await TurnJournal.load(h.file)).get("user")).toBeDefined();
     await h.internal.recoverDeliveries();
+    expect(h.update).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now() + 15_000);
+    await h.internal.recoverDeliveries();
     expect(h.send).not.toHaveBeenCalled();
     expect(h.stored.get("entity")).toEqual(final);
     expect((await TurnJournal.load(h.file)).get("user")).toBeUndefined();
     expect(h.update.mock.calls[1]?.[0]).toBe("entity");
+  });
+
+  it("backs off repeated delivery failures up to five minutes and retains the journal", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await harness();
+    await h.journal.recordCard("user", "entity", "reply");
+    await h.journal.saveFinalContent("user", "回复完成", "完整正文");
+    h.update.mockRejectedValue(new Error("offline"));
+    await h.internal.recoverDeliveries();
+    let attempts = 1;
+    for (const delay of [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000]) {
+      vi.setSystemTime(Date.now() + delay - 1);
+      await h.internal.recoverDeliveries();
+      expect(h.update).toHaveBeenCalledTimes(attempts);
+      vi.setSystemTime(Date.now() + 1);
+      await h.internal.recoverDeliveries();
+      expect(h.update).toHaveBeenCalledTimes(++attempts);
+    }
+    expect((await TurnJournal.load(h.file)).get("user")?.finalContent?.body).toBe("完整正文");
+    expect(h.send).not.toHaveBeenCalled();
+    h.update.mockImplementation(async (id, card) => { h.stored.set(id, card); });
+    vi.setSystemTime(Date.now() + 300_000);
+    await h.internal.recoverDeliveries();
+    expect(h.journal.get("user")).toBeUndefined();
+  });
+
+  it("recovers saved nested blocks using compatible Markdown without changing the saved answer", async () => {
+    const h = await harness();
+    const body = "1. Rule\n\n   ```text\n   if ready:\n       grant()\n   ```\n\n   | Name | Value |\n   |---|---|\n   | quota | 20000 |";
+    await h.journal.recordCard("user", "entity", "reply");
+    await h.journal.saveFinalContent("user", "回复完成", body);
+    h.internal.journal = await TurnJournal.load(h.file);
+    await h.internal.recoverDeliveries();
+    const delivered = h.stored.get("entity") as { body: { elements: Array<{ content: string }> } };
+    expect(delivered.body.elements[1]?.content).toContain("\n```text\nif ready:\n    grant()\n```\n");
+    expect(delivered.body.elements[1]?.content).toContain("\n| Name | Value |\n|---|---|\n| quota | 20000 |");
+    expect(h.journal.get("user")?.finalContent?.body).toBe(body);
+    expect((await TurnJournal.load(h.file)).get("user")).toBeUndefined();
+    expect(h.send).not.toHaveBeenCalled();
   });
 
   it("marks interrupted work on its existing card and retains ambiguous sends without duplication", async () => {
@@ -74,6 +117,52 @@ describe("delivery recovery and connection retry", () => {
     expect(h.send).toHaveBeenCalledTimes(1);
     expect(h.send).toHaveBeenCalledWith("chat", { cardId: "entity" }, { replyTo: "user", replyInThread: true });
     expect(h.journal.get("user")).toBeUndefined();
+  });
+
+  it.each(["live", "recovery"])("persists a late %s send acknowledgement after the local timeout without resending", async mode => {
+    vi.useFakeTimers();
+    const h = await harness();
+    let acknowledge!: (result: { messageId: string }) => void;
+    h.send.mockImplementation(() => new Promise(resolve => { acknowledge = resolve; }));
+    const producer = vi.fn(async () => undefined);
+    if (mode === "recovery") await h.journal.recordCard("user", "entity");
+    const pending = (mode === "live"
+      ? h.client.outboundCardClient().streamMarkdown("chat", "user", { replyInThread: true, initialStatus: "处理中" }, producer)
+      : h.internal.recoverDeliveries()).catch(error => error as Error);
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(15_000);
+    const result = await pending;
+    if (mode === "live") expect(result).toBeInstanceOf(Error);
+    expect(producer).not.toHaveBeenCalled();
+    expect(h.journal.get("user")?.cards[0]?.messageId).toBeUndefined();
+
+    acknowledge({ messageId: "reply" });
+    await vi.waitFor(() => expect(h.journal.get("user")?.cards[0]?.messageId).toBe("reply"));
+    await h.journal.close();
+    expect((await TurnJournal.load(h.file)).get("user")?.cards[0]?.messageId).toBe("reply");
+    await vi.advanceTimersByTimeAsync(15_000);
+    await h.internal.recoverDeliveries();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.journal.get("user")).toBeUndefined();
+  });
+
+  it("handles a late send rejection and retains the ambiguous original card", async () => {
+    vi.useFakeTimers();
+    const h = await harness();
+    let failSend!: (reason: Error) => void;
+    h.send.mockImplementation(() => new Promise((_resolve, reject) => { failSend = reject; }));
+    const pending = h.client.outboundCardClient().streamMarkdown(
+      "chat", "user", { replyInThread: true, initialStatus: "处理中" }, async () => undefined,
+    ).catch(error => error as Error);
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await pending).toBeInstanceOf(Error);
+    failSend(new Error("connection reset after timeout"));
+    await vi.advanceTimersByTimeAsync(0);
+    await h.internal.recoverDeliveries();
+    expect(h.journal.get("user")?.cards[0]?.messageId).toBeUndefined();
+    expect(h.journal.get("user")?.cards[0]?.sendStartedAtMs).toBeDefined();
+    expect(h.send).toHaveBeenCalledTimes(1);
   });
 
   it("recovers the authoritative answer saved before final card allocation", async () => {
@@ -106,6 +195,28 @@ describe("delivery recovery and connection retry", () => {
     expect(finalCardMatches(JSON.stringify(expected), expected)).toBe(true);
     expect(finalCardMatches(JSON.stringify(managedCardSpec("回复完成", "a*b", false)), managedCardSpec("回复完成", "ab", false))).toBe(false);
     expect(finalCardMatches(JSON.stringify(managedCardSpec("> ✅ **回复完成**", "完整正文尾部", true)), expected)).toBe(false);
+  });
+
+  it("reads CardKit code-block token lines and still rejects missing or altered code", () => {
+    const expected = managedCardSpec("✅ 回复完成", "规则：\n```python\nif ready:\n    grant(20000)\n```\n结束。", false);
+    const block = { tag: "code_block", property: { contents: [
+      { contents: [{ content: "if ready:", contentType: "text" }, { content: "\n", contentType: "text" }] },
+      { contents: [{ contentType: "text" }, { content: "    grant(20000)", contentType: "text" }, { content: "\n", contentType: "text" }] },
+    ] } };
+    const compiled = (includeCode: boolean) => JSON.stringify({ json_card: JSON.stringify({
+      config: { streamingMode: false },
+      body: { property: { elements: [
+        { tag: "markdown", property: { elements: [{ tag: "plain_text", property: { content: "✅ 回复完成" } }] } },
+        { tag: "markdown", property: { elements: [
+          { tag: "plain_text", property: { content: "规则：" } },
+          ...(includeCode ? [block] : []),
+          { tag: "plain_text", property: { content: "结束。" } },
+        ] } },
+      ] } },
+    }) });
+    expect(finalCardMatches(compiled(true), expected)).toBe(true);
+    expect(finalCardMatches(compiled(false), expected)).toBe(false);
+    expect(finalCardMatches(compiled(true).replace("20000", "2000"), expected)).toBe(false);
   });
 
   it("accepts a final card whose Markdown table is compiled by CardKit", () => {

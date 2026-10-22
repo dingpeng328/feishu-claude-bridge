@@ -8,7 +8,7 @@
  * Concurrency: each topic (threadId) gets its own serial promise chain (ordered
  * within a topic), different topics run concurrently, capped by a semaphore.
  *
- * Pure-chat: the agent's reply = its streamed assistant text; success = exitCode 0.
+ * Pure-chat: success requires reply text, exitCode 0, and no terminal error or timeout.
  * No worktree, no state.json contract.
  */
 
@@ -60,17 +60,33 @@ export class BridgeHandler {
     const inflight = new Map<string, AbortController>();
 
     let running = 0;
-    const waiters: Array<() => void> = [];
-    const acquire = (): Promise<void> => {
+    const waiters: Array<{ grant: () => void }> = [];
+    const acquire = (signal?: AbortSignal): Promise<boolean> => {
+      if (signal?.aborted) return Promise.resolve(false);
       if (running < MAX_CONCURRENT) {
         running++;
-        return Promise.resolve();
+        return Promise.resolve(true);
       }
-      return new Promise<void>((resolve) => waiters.push(resolve));
+      return new Promise<boolean>((resolve) => {
+        const onAbort = (): void => {
+          const index = waiters.indexOf(waiter);
+          if (index < 0) return;
+          waiters.splice(index, 1);
+          resolve(false);
+        };
+        const waiter = {
+          grant: (): void => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve(true);
+          },
+        };
+        waiters.push(waiter);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
     };
     const release = (): void => {
       const next = waiters.shift();
-      if (next) next();
+      if (next) next.grant();
       else running--;
     };
 
@@ -167,7 +183,7 @@ export class BridgeHandler {
     event: LarkMessageEvent,
     signal?: AbortSignal,
     startedAtMs = Date.now(),
-    acquire: () => Promise<void> = async () => undefined,
+    acquire: (signal?: AbortSignal) => Promise<boolean> = async () => true,
     release: () => void = () => undefined,
   ): Promise<void> {
     const parsed = parseMessage(event);
@@ -243,8 +259,11 @@ export class BridgeHandler {
     let acquired = false;
 
     try {
-      await acquire();
-      acquired = true;
+      acquired = await acquire(signal);
+      if (!acquired) {
+        await card.finalize({ success: false, interrupted: true, interruptionReason: interruptionReason(signal) });
+        return;
+      }
       card.setPhase?.("Agent 正在思考或执行任务");
       // Shared cwd for all topics (e.g. a real repo). Topics stay isolated by
       // their own agent session (--resume/resume by threadId), not by separate dirs.
@@ -285,12 +304,18 @@ export class BridgeHandler {
 
         let sessionId: string | undefined;
         let lastText = "";
+        let resultFailed = false;
+        let agentProgress = false;
 
         try {
           for await (const ev of handle.events) {
+            if (ev.type === "text_delta" || ev.type === "tool_started" || ev.type === "tool_finished") {
+              agentProgress = true;
+            }
             if (card) card.handle(ev);
             if (ev.type === "system_init") sessionId = ev.sessionId;
             if (ev.type === "text_delta") lastText = ev.text;
+            if (ev.type === "result" && ev.isError) resultFailed = true;
           }
           const result = await handle.done;
           const now = Date.now();
@@ -318,7 +343,7 @@ export class BridgeHandler {
           }
 
           if (card) {
-            const success = result.exitCode === 0 && !result.termination && !!lastText.trim();
+            const success = result.exitCode === 0 && !result.termination && !resultFailed && !!lastText.trim();
             const cardBody = lastText.trim()
               ? lastText
               : "⚠️ 本轮没有拿到 agent 的回复(可能被中断),再 @ 我一次重试。";
@@ -327,6 +352,10 @@ export class BridgeHandler {
           }
           break; // done
         } catch (spawnErr) {
+          // A stream/card consumer can throw while the process is still alive.
+          // Stop and drain it before retrying or releasing this topic's slot.
+          handle.kill();
+          await handle.done.catch(() => undefined);
           // If we were interrupted, a kill-induced error is expected — treat as
           // interrupted (⏸️), not a failure. Persist sessionId if we got one.
           if (signal?.aborted) {
@@ -348,15 +377,15 @@ export class BridgeHandler {
           // is corrupt — e.g. an interrupt (SIGTERM) landed mid tool-call, leaving
           // a half-written tool_use in claude's session history, so the next
           // resume makes the model emit an unparseable tool call ("could not be
-          // parsed") and claude exits 1. Also covers a ghost session
+          // parsed"). Also covers a ghost session
           // ("No conversation found"). Self-heal: drop the session and retry ONCE
           // fresh (loses the interrupted turn's context, but returns a real reply
-          // instead of an error card). Bounded by attempt===1.
+          // instead of an error card). Only retry before observable agent activity
+          // and on the first attempt, so completed tool side effects aren't replayed.
           const resumeLikelyBad =
             currentExisting != null &&
-            (errMsg.includes("No conversation found") ||
-              errMsg.includes("could not be parsed") ||
-              errMsg.includes("exited with code 1"));
+            !agentProgress &&
+            (errMsg.includes("No conversation found") || errMsg.includes("could not be parsed"));
           if (attempt === 1 && resumeLikelyBad) {
             console.warn(
               `[handler] thread ${threadId}: resumed session ${currentExisting?.sessionId} likely ` +
@@ -402,7 +431,7 @@ export class BridgeHandler {
       });
     } catch (err) {
       console.error("[handler] failed to start card for thread", threadId, err);
-      // Continue without a card — session bookkeeping still matters.
+      // The caller stops this turn when no visible reply surface was created.
       return undefined;
     }
   }

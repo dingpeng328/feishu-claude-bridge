@@ -66,6 +66,12 @@ interface ProtocolOptions {
   botAgent: string;
 }
 
+interface ApiStatus {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+}
+
 const LOSSLESS_ID_FIELDS = new Set(["message_id", "msg_id", "svr_id"]);
 
 /** Preserve uint64 IDs that exceed JavaScript's safe integer range. */
@@ -199,7 +205,7 @@ export class WechatProtocolClient {
     contextToken?: string;
     runId?: string;
   }): Promise<void> {
-    const response = await this.post<{ ret?: number; errmsg?: string }>("ilink/bot/sendmessage", {
+    const response = await this.post<ApiStatus>("ilink/bot/sendmessage", {
       msg: {
         from_user_id: "",
         to_user_id: params.to,
@@ -212,22 +218,21 @@ export class WechatProtocolClient {
       },
       base_info: this.baseInfo(),
     }, { timeoutMs: 15_000 });
-    if (response.ret !== undefined && response.ret !== 0) {
-      throw new Error(`微信发送失败：ret=${response.ret} ${response.errmsg ?? ""}`.trim());
-    }
+    this.assertSuccess("sendmessage", response);
   }
 
   async getTypingTicket(userId: string, contextToken?: string): Promise<string | undefined> {
-    const response = await this.post<{ ret?: number; typing_ticket?: string }>("ilink/bot/getconfig", {
+    const response = await this.post<ApiStatus & { typing_ticket?: string }>("ilink/bot/getconfig", {
       ilink_user_id: userId,
       context_token: contextToken,
       base_info: this.baseInfo(),
     }, { timeoutMs: 10_000 });
-    return response.ret === 0 ? response.typing_ticket : undefined;
+    this.assertSuccess("getconfig", response);
+    return response.typing_ticket;
   }
 
   async sendTyping(userId: string, ticket: string, typing: boolean): Promise<void> {
-    const response = await this.post<{ ret?: number; errmsg?: string }>("ilink/bot/sendtyping", {
+    const response = await this.post<ApiStatus>("ilink/bot/sendtyping", {
       ilink_user_id: userId,
       typing_ticket: ticket,
       status: typing ? 1 : 2,
@@ -237,7 +242,7 @@ export class WechatProtocolClient {
   }
 
   async notifyStarted(): Promise<void> {
-    const response = await this.post<{ ret?: number; errmsg?: string }>(
+    const response = await this.post<ApiStatus>(
       "ilink/bot/msg/notifystart",
       { base_info: this.baseInfo() },
       { timeoutMs: 10_000 },
@@ -246,7 +251,7 @@ export class WechatProtocolClient {
   }
 
   async notifyStopped(): Promise<void> {
-    const response = await this.post<{ ret?: number; errmsg?: string }>(
+    const response = await this.post<ApiStatus>(
       "ilink/bot/msg/notifystop",
       { base_info: this.baseInfo() },
       { timeoutMs: 10_000 },
@@ -254,9 +259,10 @@ export class WechatProtocolClient {
     this.assertSuccess("notifystop", response);
   }
 
-  private assertSuccess(operation: string, response: { ret?: number; errmsg?: string }): void {
-    if (response.ret !== undefined && response.ret !== 0) {
-      throw new Error(`微信 ${operation} 失败：ret=${response.ret} ${response.errmsg ?? ""}`.trim());
+  private assertSuccess(operation: string, response: ApiStatus): void {
+    if ((response.ret !== undefined && response.ret !== 0) ||
+        (response.errcode !== undefined && response.errcode !== 0)) {
+      throw new Error(`微信 ${operation} 失败：ret=${response.ret ?? "-"} errcode=${response.errcode ?? "-"} ${response.errmsg ?? ""}`.trim());
     }
   }
 

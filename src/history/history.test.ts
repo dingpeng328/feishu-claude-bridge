@@ -115,12 +115,15 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_t
     const { store, reader, dir } = await setup();
     const trace = store.begin({ ...context, agent: 'codex' })!;
     trace.record({ type: 'tool_started', raw: { api_key: 'super-secret', nested: { password: 'pw-secret' }, authorization: 'Bearer token-secret' } });
+    trace.record({ type: 'tool_started', raw: { OPENAI_API_KEY: 'env-secret', appSecret: 'camel-secret' }, text: 'api_key="text-secret"' });
     trace.record({ type: 'tool_finished', raw: '中文'.repeat(150000) });
     trace.finish('completed');
     const contents = await readFile(path.join(dir, `${trace.summary.id}.jsonl`), 'utf8');
     expect(contents).not.toContain('super-secret'); expect(contents).not.toContain('pw-secret');
     expect(contents).not.toContain('token-secret');
-    expect((await reader.events(trace.summary.id, 0))?.events[1].truncated).toBe(true);
+    expect(contents).not.toContain('env-secret'); expect(contents).not.toContain('camel-secret');
+    expect(contents).not.toContain('text-secret');
+    expect((await reader.events(trace.summary.id, 0))?.events[2].truncated).toBe(true);
   });
 
   it("incrementally reads large histories without duplicates or UTF-8 loss, ignoring an incomplete tail", async () => {

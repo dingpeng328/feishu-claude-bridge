@@ -155,6 +155,14 @@ describe("codex support", () => {
     expect(reasoning[0]).toMatchObject({ type: "raw" });
   });
 
+  it("recognizes a failed Codex turn as a terminal error", () => {
+    expect([..._parseLinesMulti(JSON.stringify({
+      type: "turn.failed", error: { message: "rate limit exceeded" },
+    }), "codex")]).toEqual([
+      expect.objectContaining({ type: "result", stopReason: "turn_failed", isError: true }),
+    ]);
+  });
+
   it("builds codex exec and resume commands", () => {
     expect(_buildCommand({ agentKind: "codex", prompt: "hi" })).toEqual([
       "codex",

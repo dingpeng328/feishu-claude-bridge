@@ -393,6 +393,67 @@ describe("BridgeHandler.handleOne", () => {
     await waitFor(() => deps.card.finalizeArgs !== undefined);
     expect(deps.card.finalizeArgs).toMatchObject({ success: false });
   });
+
+  it("does not report success for an error result even when the CLI exits zero", async () => {
+    runAgentMock.mockReturnValue(fakeRun([
+      { type: "text_delta", text: "执行了一部分", raw: {} },
+      { type: "result", stopReason: "turn_failed", isError: true, raw: {} },
+    ]));
+    const deps = makeDeps([topEvent("test")]);
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+    expect(deps.card.finalizeArgs).toMatchObject({ success: false, finalText: "执行了一部分" });
+  });
+
+  it("does not replay a resumed request for an unrelated exit-code-one failure", async () => {
+    await store.put({ threadId: "om_top", sessionId: "existing", createdTs: 1, lastActiveTs: 1 });
+    runAgentMock.mockReturnValue(failingRun("claude exited with code 1\nstderr: rate limit exceeded"));
+    const deps = makeDeps([topEvent("test")]);
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+    expect(runAgentMock).toHaveBeenCalledOnce();
+    expect(store.get("om_top")?.sessionId).toBe("existing");
+    expect(deps.card.finalizeArgs).toMatchObject({ success: false });
+  });
+
+  it.each<AgentStreamEvent>([
+    { type: "text_delta", text: "正在执行", raw: {} },
+    { type: "tool_started", toolName: "Bash", raw: {} },
+    { type: "tool_finished", toolName: "Bash", isError: false, raw: {} },
+  ])("does not replay a stale-session failure after $type progress", async (event) => {
+    await store.put({ threadId: "om_top", sessionId: "existing", createdTs: 1, lastActiveTs: 1 });
+    runAgentMock.mockReturnValue({
+      ...failingRun("claude exited with code 1\nstderr: tool call could not be parsed"),
+      events: fakeRun([event]).events,
+    });
+    const deps = makeDeps([topEvent("test")]);
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+    expect(runAgentMock).toHaveBeenCalledOnce();
+    expect(store.get("om_top")?.sessionId).toBe("existing");
+    expect(deps.card.finalizeArgs).toMatchObject({ success: false });
+  });
+
+  it("kills and drains the active agent if consuming its stream throws", async () => {
+    let resolveDone!: (result: { exitCode: number }) => void;
+    const done = new Promise<{ exitCode: number }>(resolve => { resolveDone = resolve; });
+    const kill = vi.fn(() => resolveDone({ exitCode: 1 }));
+    runAgentMock.mockReturnValue({
+      events: fakeRun([{ type: "text_delta", text: "partial", raw: {} }]).events,
+      done,
+      kill,
+    });
+    const deps = makeDeps([topEvent("test")]);
+    deps.cardRenderer.start.mockImplementationOnce(async () => ({
+      messageId: "om_card",
+      handle: () => { throw new Error("render failed"); },
+      finalize: async (args: unknown) => { deps.card.finalizeArgs = args; },
+    }));
+    await makeHandler(deps).run();
+    await waitFor(() => deps.card.finalizeArgs !== undefined);
+    expect(kill).toHaveBeenCalledOnce();
+    expect(deps.card.finalizeArgs).toMatchObject({ success: false });
+  });
 });
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -473,6 +534,31 @@ function inThreadReply(
 }
 
 describe("BridgeHandler interrupt (same-thread)", () => {
+  it("finalizes a cancelled queued turn without waiting for another topic's slot", async () => {
+    runAgentMock.mockImplementation(opts => abortableRun(opts, "session"));
+    const events = Array.from({ length: 6 }, (_, i) => topLevelEvent(`queued_${i}`, "test"));
+    const deps = makeDeps(events);
+    const finalized = new Map<string, unknown>();
+    deps.cardRenderer.start.mockImplementation(async (_chatId?: unknown, messageId?: unknown) => ({
+      messageId: String(messageId),
+      handle: () => 0,
+      finalize: async (args: unknown) => { finalized.set(String(messageId), args); },
+    }));
+    deps.client.events = async function* () {
+      for (const event of events) yield event;
+      await waitFor(() => deps.cardRenderer.start.mock.calls.length === 6);
+      yield inThreadReply("replacement", "queued_5", "追加要求", true);
+    };
+    const handler = makeHandler(deps);
+    try {
+      await handler.run();
+      await waitFor(() => finalized.has("queued_5"));
+      expect(finalized.get("queued_5")).toMatchObject({ interrupted: true });
+      expect(runAgentMock).toHaveBeenCalledTimes(5);
+      await waitFor(() => deps.cardRenderer.start.mock.calls.length === 7);
+    } finally { await handler.close(); }
+  });
+
   it("shows queued cards before obtaining a slot and drains interrupted cards on close", async () => {
     runAgentMock.mockImplementation(opts => abortableRun(opts, "session"));
     const deps = makeDeps(Array.from({ length: 6 }, (_, i) => topLevelEvent(`task_${i}`, "test")));

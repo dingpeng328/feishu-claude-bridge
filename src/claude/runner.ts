@@ -242,6 +242,10 @@ function* parseCodexObject(obj: unknown): Generator<AgentStreamEvent> {
     yield { type: "result", stopReason: "turn_completed", isError: false, raw: obj };
     return;
   }
+  if (eventType === "turn.failed") {
+    yield { type: "result", stopReason: "turn_failed", isError: true, raw: obj };
+    return;
+  }
   if (eventType === "error") {
     yield { type: "raw", raw: obj };
     return;
@@ -312,6 +316,7 @@ export function runAgent(opts: RunOptions): RunHandle {
 
   let discoveredSessionId: string | undefined;
   let processExited = false;
+  let settled = false;
   let termination: "timeout" | "interrupted" | undefined;
   const groupAlive = (): boolean => {
     if (process.platform === "win32" || !child.pid) return !processExited;
@@ -341,7 +346,7 @@ export function runAgent(opts: RunOptions): RunHandle {
   let killTimer: ReturnType<typeof setTimeout> | undefined;
   let postKillTimer: ReturnType<typeof setTimeout> | undefined;
   function doKill(reason: "interrupted" | "post_result_cleanup" = "interrupted", resultSucceeded = false): void {
-    if (killScheduled) return;
+    if (settled || killScheduled) return;
     killScheduled = true;
     if (reason === "post_result_cleanup") {
       postResultCleanup = true;
@@ -399,7 +404,6 @@ export function runAgent(opts: RunOptions): RunHandle {
   const rlAbortController = new AbortController();
 
   const done = new Promise<{ exitCode: number; sessionId?: string; termination?: "timeout" | "interrupted" }>((resolve, reject) => {
-    let settled = false;
     const finalizeResolve = (exitCode: number): void => {
       if (settled) return;
       if (killScheduled && !terminationEscalated && groupAlive()) {
@@ -455,7 +459,7 @@ export function runAgent(opts: RunOptions): RunHandle {
     child.on("close", (code: number | null) => finalizeResolve(code ?? 1));
 
     // Fallback: 'exit' fired (process gone) but 'close' (stdio drained) didn't
-    // within 5s — grandchild holding stdio. Force-resolve so the handler can finalize.
+    // within 5s. Clean up owned descendants before unblocking the handler.
     child.on("exit", (code: number | null) => {
       processExited = true;
       if (settled) return;
@@ -463,8 +467,11 @@ export function runAgent(opts: RunOptions): RunHandle {
         if (settled) return;
         console.warn(
           `[runner] child pid=${child.pid} exited (code=${code ?? "signal"}) but 'close' didn't ` +
-            `fire within 5s — force-resolving + aborting readline.`,
+            `fire within 5s — cleaning up remaining processes before settling.`,
         );
+        // A naturally exited parent can still leave owned tool processes alive.
+        // Stop that group before settling, just as for an explicitly killed turn.
+        if (groupAlive()) doKill("post_result_cleanup", code === 0);
         finalizeResolve(code ?? 1);
       }, 5_000);
       t.unref();

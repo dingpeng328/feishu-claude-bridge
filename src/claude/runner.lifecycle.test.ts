@@ -14,6 +14,45 @@ afterEach(async () => {
 });
 
 describe("runner process lifecycle", () => {
+  it.skipIf(process.platform === "win32")("cleans up a tool that outlives a naturally exited parent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fcb-runner-orphan-"));
+    dirs.push(dir);
+    const bin = join(dir, "agent.mjs");
+    await writeFile(bin, `#!/usr/bin/env node
+import { spawn } from 'node:child_process';
+const tool = spawn(process.execPath, ['-e', 'setInterval(()=>{},100)'], {stdio:['ignore',process.stdout,process.stderr]});
+console.log(JSON.stringify({type:'ready',pid:process.pid,toolPid:tool.pid}));
+tool.unref();
+`, { mode: 0o700 });
+    const handle = runAgent({ agentKind: "codex", agentBinPath: bin, prompt: "test", timeoutMs: 20_000 });
+    let toolPid = 0;
+    for await (const event of handle.events) {
+      const raw = event.raw as { type?: string; pid?: number; toolPid?: number };
+      if (raw.type === "ready") {
+        ownedPids.push(raw.pid!);
+        toolPid = raw.toolPid!;
+      }
+    }
+    await expect(handle.done).resolves.toMatchObject({ exitCode: 0 });
+    expect(toolPid).toBeGreaterThan(0);
+    await vi.waitFor(() => { expect(() => process.kill(toolPid, 0)).toThrow(); }, { timeout: 1500 });
+  }, 12_000);
+
+  it("does not signal a finished process when kill is called after completion", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fcb-runner-done-"));
+    dirs.push(dir);
+    const bin = join(dir, "agent.mjs");
+    await writeFile(bin, "#!/usr/bin/env node\n", { mode: 0o700 });
+    const handle = runAgent({ agentBinPath: bin, prompt: "test" });
+    for await (const _event of handle.events) { /* drain */ }
+    await handle.done;
+    const kill = vi.spyOn(process, "kill");
+    try {
+      handle.kill();
+      expect(kill).not.toHaveBeenCalled();
+    } finally { kill.mockRestore(); }
+  });
+
   it.skipIf(process.platform === "win32")("preserves success when cleaning up a process that lingers after turn.completed", async () => {
     const dir = await mkdtemp(join(tmpdir(), "fcb-runner-completed-"));
     dirs.push(dir);

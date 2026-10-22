@@ -80,12 +80,90 @@ export function managedCardSpec(status: string, body: string, streaming: boolean
   };
 }
 
+/** CardKit drops fenced code/tables inside lists and moves parent paragraphs
+ * ahead of their sublists. Lift affected blocks to column zero for the final
+ * card, preserving code indentation relative to its opening fence.
+ * Live text stays untouched to remain append-only.
+ */
+export function normalizeCardMarkdown(text: string): string {
+  const lines = text.split("\n");
+  const output: string[] = [];
+  let fence: { marker: string; indent: string } | undefined;
+  let nestedListIndent: number | undefined;
+  let paragraphIndent: number | undefined;
+  const blank = (): void => {
+    if (output.length && output.at(-1)?.trim()) output.push("");
+  };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    if (fence) {
+      const closing = line.match(/^[ \t]*(`{3,}|~{3,})[ \t]*$/);
+      if (closing && closing[1]![0] === fence.marker[0] && closing[1]!.length >= fence.marker.length) {
+        output.push(fence.indent ? line.trimStart() : line);
+        if (fence.indent && lines[index + 1]?.trim()) output.push("");
+        fence = undefined;
+      } else {
+        // Strip only the surrounding list indentation, never code's own indent.
+        let removed = 0;
+        while (removed < fence.indent.length && /[ \t]/.test(line[removed] ?? "")) removed++;
+        output.push(line.slice(removed));
+      }
+      continue;
+    }
+    const opening = line.match(/^([ \t]*)(`{3,}|~{3,})([^`~]*)$/);
+    if (opening) {
+      nestedListIndent = paragraphIndent = undefined;
+      fence = { indent: opening[1]!, marker: opening[2]! };
+      if (fence.indent) blank();
+      output.push(line.slice(fence.indent.length));
+      continue;
+    }
+    const table = line.match(/^([ \t]+)\|/);
+    if (table && /^[ \t]*\|(?:[ \t]*:?-{3,}:?[ \t]*\|)+[ \t]*$/.test(lines[index + 1] ?? "")) {
+      nestedListIndent = paragraphIndent = undefined;
+      blank();
+      do {
+        output.push(lines[index]!.trimStart());
+        index++;
+      } while (index < lines.length && /^[ \t]*\|/.test(lines[index]!));
+      if (lines[index]?.trim()) output.push("");
+      index--;
+      continue;
+    }
+    if (!line.trim()) {
+      paragraphIndent = undefined;
+      output.push(line);
+      continue;
+    }
+    const listItem = line.match(/^([ \t]*)(?:[-*+]|\d+[.)])[ \t]+/);
+    const indent = line.match(/^[ \t]*/)![0].length;
+    if (listItem) {
+      nestedListIndent = listItem[1]!.length || undefined;
+      paragraphIndent = undefined;
+    } else if (nestedListIndent !== undefined && indent > 0 && indent <= nestedListIndent
+      && output.at(-1)?.trim() === "") {
+      // This paragraph belongs after the sublist. Keeping it inside the parent
+      // item makes CardKit concatenate it before the child items instead.
+      paragraphIndent = indent;
+      nestedListIndent = undefined;
+    }
+    if (paragraphIndent !== undefined) {
+      output.push(line.slice(Math.min(indent, paragraphIndent)));
+      continue;
+    }
+    if (indent === 0 && !listItem) nestedListIndent = undefined;
+    output.push(line);
+  }
+  return output.join("\n");
+}
+
 /**
  * Split a long Markdown element using the same policy as the Channel SDK:
  * prefer line boundaries, keep fenced code valid across cards, and retain
  * headroom below Feishu's 30,000-character per-element limit.
  */
 export function splitManagedMarkdown(text: string, limit = BODY_CHUNK_MAX_CHARS): string[] {
+  text = normalizeCardMarkdown(text);
   if (text.length <= limit) return [text];
 
   const lines = text.split("\n");

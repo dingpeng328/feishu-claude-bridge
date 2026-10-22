@@ -63,4 +63,12 @@ describe("WeChat protocol helpers", () => {
       base_info: { channel_version: "2.4.9", bot_agent: "TestBridge/1.0.0" },
     });
   });
+
+  it("rejects errcode failures even when the HTTP status and ret indicate success", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response('{"ret":0,"errcode":-14,"errmsg":"expired"}')));
+    const client = new WechatProtocolClient({ baseUrl: "https://example.com", botAgent: "TestBridge/1.0.0" });
+    await expect(client.sendText({ to: "user", text: "回复" })).rejects.toThrow("errcode=-14");
+    await expect(client.notifyStarted()).rejects.toThrow("errcode=-14");
+    await expect(client.sendTyping("user", "ticket", true)).rejects.toThrow("errcode=-14");
+  });
 });

@@ -23,6 +23,8 @@ export interface WechatInboundEvent {
   runId?: string;
   /** Mark the inbound message handled so its durable delivery cursor may advance. */
   ack(): void;
+  /** Keep this message for replay and stop receiving new messages in this runtime. */
+  retry(): void;
 }
 
 export interface WechatMessageClient {
@@ -34,10 +36,14 @@ export interface WechatMessageClient {
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
+    const finish = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
     const onAbort = (): void => {
       clearTimeout(timer);
-      resolve();
+      finish();
     };
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
@@ -61,6 +67,7 @@ export class WechatClient implements WechatMessageClient {
   readonly #seenInRuntime = new Set<string>();
   #notifiedStarted = false;
   #persistenceTail: Promise<void> = Promise.resolve();
+  #cursorBlocked = false;
 
   constructor(options: {
     config: WechatConfig;
@@ -115,58 +122,80 @@ export class WechatClient implements WechatMessageClient {
         failures = 0;
         const nextCursor = response.get_updates_buf;
         if (nextCursor) pollCursor = nextCursor;
-        const batchAcks: Array<{ messageId: string; handled: Promise<void> }> = [];
-        for (const message of response.msgs ?? []) {
-          if (this.#abortController.signal.aborted) break;
-          const messageId = getWechatMessageId(message);
-          if (!messageId || this.#delivery.has(messageId) || this.#seenInRuntime.has(messageId)) continue;
-          this.#seenInRuntime.add(messageId);
-          const fromUserId = message.from_user_id?.trim() || "";
-          const isUserMessage = message.message_type === WechatMessageType.USER;
-          const isFinished =
-            message.message_state === undefined || message.message_state === WechatMessageState.FINISH;
-          if (!isUserMessage || !isFinished || fromUserId !== this.#credentials.userId) {
-            batchAcks.push({ messageId, handled: Promise.resolve() });
-            continue;
-          }
+        const batchAcks: Array<{ messageId: string; handled: Promise<boolean> }> = [];
+        const messages = response.msgs ?? [];
+        let visited = 0;
+        try {
+          for (const message of messages) {
+            if (this.#abortController.signal.aborted) {
+              break;
+            }
+            visited++;
+            const messageId = getWechatMessageId(message);
+            if (!messageId || this.#delivery.has(messageId) || this.#seenInRuntime.has(messageId)) continue;
+            const fromUserId = message.from_user_id?.trim() || "";
+            const isUserMessage = message.message_type === WechatMessageType.USER;
+            const isFinished =
+              message.message_state === undefined || message.message_state === WechatMessageState.FINISH;
+            // A later update may carry the final text under the same message ID.
+            // Partial messages must not poison either durable or runtime deduplication.
+            if (isUserMessage && !isFinished && fromUserId === this.#credentials.userId) continue;
+            this.#seenInRuntime.add(messageId);
+            if (!isUserMessage || fromUserId !== this.#credentials.userId) {
+              batchAcks.push({ messageId, handled: Promise.resolve(true) });
+              continue;
+            }
 
-          let acknowledged = false;
-          let acknowledge!: () => void;
-          const handled = new Promise<void>((resolve) => {
-            acknowledge = resolve;
-          });
-          batchAcks.push({ messageId, handled });
-          yield {
-            message,
-            messageId,
-            conversationId: getWechatConversationId(message),
-            fromUserId,
-            text: extractWechatText(message),
-            contextToken: message.context_token,
-            runId: message.run_id,
-            ack: () => {
-              if (acknowledged) return;
-              acknowledged = true;
-              acknowledge();
-            },
-          };
-        }
-        // Poll again using the server cursor immediately, but serialize durable
-        // cursor writes behind per-message acknowledgements. If the process
-        // crashes mid-turn, the old cursor remains and that message is replayed.
-        this.#persistenceTail = this.#persistenceTail.then(async () => {
-          for (const item of batchAcks) {
-            await item.handled;
-            await this.#delivery.commit(item.messageId, undefined);
+            let acknowledged = false;
+            let acknowledge!: (handled: boolean) => void;
+            const handled = new Promise<boolean>((resolve) => {
+              acknowledge = resolve;
+            });
+            batchAcks.push({ messageId, handled });
+            yield {
+              message,
+              messageId,
+              conversationId: getWechatConversationId(message),
+              fromUserId,
+              text: extractWechatText(message),
+              contextToken: message.context_token,
+              runId: message.run_id,
+              ack: () => {
+                if (acknowledged) return;
+                acknowledged = true;
+                acknowledge(true);
+              },
+              retry: () => {
+                if (acknowledged) return;
+                acknowledged = true;
+                acknowledge(false);
+                this.#abortController.abort();
+              },
+            };
           }
-          await this.#delivery.commit(undefined, nextCursor);
-        });
-        // flush() observes the rejection during shutdown; this attached handler
-        // also prevents an early unhandled-rejection warning while turns run.
-        void this.#persistenceTail.catch((err) => {
-          console.error(`[wechat-client] 无法持久化消息游标：${String(err)}`);
-          this.#abortController.abort();
-        });
+        } finally {
+          // Poll again using the server cursor immediately, but serialize durable
+          // cursor writes behind per-message acknowledgements. If the process
+          // crashes mid-turn, the old cursor remains and that message is replayed.
+          this.#persistenceTail = this.#persistenceTail.then(async () => {
+            for (const item of batchAcks) {
+              if (await item.handled) {
+                await this.#delivery.commit(item.messageId, undefined);
+                this.#seenInRuntime.delete(item.messageId);
+              } else {
+                this.#cursorBlocked = true;
+              }
+            }
+            if (visited < messages.length) this.#cursorBlocked = true;
+            if (!this.#cursorBlocked && nextCursor) await this.#delivery.commit(undefined, nextCursor);
+          });
+          // flush() observes the rejection during shutdown; this attached handler
+          // also prevents an early unhandled-rejection warning while turns run.
+          void this.#persistenceTail.catch((err) => {
+            console.error(`[wechat-client] 无法持久化消息游标：${String(err)}`);
+            this.#abortController.abort();
+          });
+        }
       } catch (err) {
         if (this.#abortController.signal.aborted) break;
         failures++;

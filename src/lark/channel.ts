@@ -293,6 +293,11 @@ function compiledCardText(value: unknown): string {
   const content = directString(record, "content") ?? directString(property, "content");
   if (content !== undefined) return content;
 
+  // CardKit returns code blocks as lines of token fragments in `contents`,
+  // rather than the `elements` tree used by ordinary Markdown text.
+  const contents = property?.["contents"] ?? record["contents"];
+  if (Array.isArray(contents)) return contents.map(compiledCardText).join("");
+
   // CardKit compiles Markdown tables into a distinct `table` node rather than
   // nested elements. Preserve its visible cells so delivery verification does
   // not mistake a successfully rendered table for a truncated response.
@@ -613,6 +618,8 @@ const CATCH_UP_OVERLAP_MS = 60_000; // overlap + message-id dedup avoids timesta
 const CHAT_DISCOVERY_INTERVAL_MS = 60 * 60_000;
 const SDK_TIMEOUT_MS = 15_000;
 const SDK_KEEPALIVE_INTERVAL_MS = 15_000;
+const DELIVERY_RETRY_BASE_MS = 15_000;
+const DELIVERY_RETRY_MAX_MS = 5 * 60_000;
 
 /** Centralize the SDK knobs so reconnect and native-stream behavior stay testable. */
 export function buildChannelSdkOptions(
@@ -760,6 +767,7 @@ export class ChannelClient {
   private reconnectFailures = 0;
   private journal: TurnJournal | undefined;
   private readonly recoveryIds = new Set<string>();
+  private readonly recoveryRetries = new Map<string, { failures: number; nextAttemptAtMs: number }>();
   private recoveryRunning: Promise<void> | undefined;
   private recoveryTimer: ReturnType<typeof setInterval> | undefined;
   private inboundWrites: Promise<void> = Promise.resolve();
@@ -938,7 +946,7 @@ export class ChannelClient {
     this.lastInboundAt = Date.now();
     log(`connected as ${channel.botIdentity?.name ?? "?"} (${channel.botIdentity?.openId ?? "?"})`);
     if (!this.recoveryTimer) {
-      this.recoveryTimer = setInterval(() => this.requestRecovery(), 15_000);
+      this.recoveryTimer = setInterval(() => this.requestRecovery(), DELIVERY_RETRY_BASE_MS);
       this.recoveryTimer.unref();
     }
     this.requestRecovery();
@@ -1000,6 +1008,7 @@ export class ChannelClient {
 
   async discardTask(messageId: string): Promise<void> {
     this.recoveryIds.delete(messageId);
+    this.recoveryRetries.delete(messageId);
     await this.journal?.remove(messageId);
   }
 
@@ -1014,7 +1023,9 @@ export class ChannelClient {
     for (const id of [...this.recoveryIds]) {
       if (this.closed) return;
       const turn = this.journal!.get(id);
-      if (!turn) { this.recoveryIds.delete(id); continue; }
+      if (!turn) { this.recoveryIds.delete(id); this.recoveryRetries.delete(id); continue; }
+      const retry = this.recoveryRetries.get(id);
+      if (retry && Date.now() < retry.nextAttemptAtMs) continue;
       const channel = this.channel!;
       try {
         const elapsed = Math.max(0, Math.round((Date.now() - turn.startedAtMs) / 1000));
@@ -1038,9 +1049,7 @@ export class ChannelClient {
         for (let index = 0; index < turn.cards.length; index++) {
           const card = turn.cards[index]!;
           if (!card.messageId && card.sendStartedAtMs === undefined) {
-            await this.journal!.markSending(id, card.cardId);
-            const sent = await withTimeout(channel.send(turn.chatId, { cardId: card.cardId }, { replyTo: id, replyInThread: turn.replyInThread }), SDK_TIMEOUT_MS, "send unsent recovery card");
-            await this.journal!.recordCard(id, card.cardId, sent.messageId);
+            const sent = await this.sendTrackedCard(channel, turn.chatId, card.cardId, id, turn.replyInThread);
             card.messageId = sent.messageId;
           }
           const final = plans[index]!.card;
@@ -1049,15 +1058,21 @@ export class ChannelClient {
           await withTimeout(channel.updateCardById(card.cardId, final, sequence), SDK_TIMEOUT_MS, "recover original card");
           // A crash during send can leave the remote message id unknown. Do not
           // send another message in that ambiguous state; retain the journal.
-          if (!card.messageId || !await this.verifyCard(card.messageId, final)) {
-            throw new Error(`original card delivery unconfirmed card_id=${card.cardId}`);
+          if (!card.messageId) {
+            throw new Error(`original card send acknowledgement missing card_id=${card.cardId}`);
+          }
+          if (!await this.verifyCard(card.messageId, final)) {
+            throw new Error(`original card body mismatch card_id=${card.cardId} reply_message_id=${card.messageId}`);
           }
         }
         if (turn.cards.length < targetCount) throw new Error("continuation delivery awaits the original send acknowledgement");
         await this.discardTask(id);
         console.log(`[delivery] recovered original cards for message_id=${id}`);
       } catch (err) {
-        console.warn(`[delivery] retry pending message_id=${id}: ${safeErrorMessage(err)}`);
+        const failures = (retry?.failures ?? 0) + 1;
+        const delayMs = Math.min(DELIVERY_RETRY_MAX_MS, DELIVERY_RETRY_BASE_MS * 2 ** Math.min(failures - 1, 5));
+        this.recoveryRetries.set(id, { failures, nextAttemptAtMs: Date.now() + delayMs });
+        console.warn(`[delivery] retry pending message_id=${id} attempt=${failures} next_retry_ms=${delayMs}: ${safeErrorMessage(err)}`);
       }
     }
   }
@@ -1069,6 +1084,24 @@ export class ChannelClient {
     if (result.code) throw new Error(`${result.code}: ${result.msg}`);
     const item = result.data?.items?.find(item => item.message_id === messageId);
     return !!item?.body?.content && finalCardMatches(item.body.content, expected);
+  }
+
+  private async sendTrackedCard(
+    channel: LarkChannel,
+    chatId: string,
+    cardId: string,
+    turnId: string,
+    replyInThread: boolean,
+  ): Promise<{ messageId: string }> {
+    await this.journal?.markSending(turnId, cardId);
+    const sent = channel.send(chatId, { cardId }, { replyTo: turnId, replyInThread }).then(async result => {
+      // The timeout only bounds our wait; the SDK request can still succeed.
+      // Keep its acknowledgement even when it arrives late, so recovery can
+      // verify the original reply instead of retaining an ambiguous send forever.
+      await this.journal?.recordCard(turnId, cardId, result.messageId);
+      return result;
+    });
+    return withTimeout(sent, SDK_TIMEOUT_MS, `send managed CardKit entity ${cardId}`);
   }
 
   stopAccepting(): void {
@@ -1229,8 +1262,9 @@ export class ChannelClient {
   ): Promise<ApiMessageItem[]> {
     const items: ApiMessageItem[] = [];
     let pageToken: string | undefined;
-    for (let page = 0; page < 20; page++) {
-      const res = await channel.rawClient.im.v1.message.list({
+    const seenPageTokens = new Set<string>();
+    while (!this.closed && this.accepting) {
+      const res = await withTimeout(channel.rawClient.im.v1.message.list({
         params: {
           container_id_type: "chat",
           container_id: chatId,
@@ -1240,11 +1274,18 @@ export class ChannelClient {
           page_size: 50,
           page_token: pageToken,
         },
-      });
+      }), SDK_TIMEOUT_MS, `list catch-up messages ${chatId}`);
       if (res.code && res.code !== 0) throw new Error(`${res.code}: ${res.msg ?? "message.list failed"}`);
       items.push(...(res.data?.items ?? []));
-      if (!res.data?.has_more || !res.data.page_token) break;
-      pageToken = res.data.page_token;
+      if (!res.data?.has_more) break;
+      const nextToken = res.data.page_token;
+      // An incomplete page sequence must never advance the global cursor past
+      // unseen mentions. Busy chats can legitimately exceed twenty pages.
+      if (!nextToken || seenPageTokens.has(nextToken)) {
+        throw new Error(`[channel] missing or repeated page_token while catching up chat ${chatId}`);
+      }
+      seenPageTokens.add(nextToken);
+      pageToken = nextToken;
     }
     return items;
   }
@@ -1322,18 +1363,7 @@ export class ChannelClient {
         return created;
       },
       async sendCard(chatId, cardId, replyToMessageId, replyInThread) {
-        await client.journal?.markSending(turnId, cardId);
-        const sent = await withTimeout(
-          getChannel().send(
-            chatId,
-            { cardId },
-            { replyTo: replyToMessageId, replyInThread },
-          ),
-          SDK_TIMEOUT_MS,
-          `send managed CardKit entity ${cardId}`,
-        );
-        await client.journal?.recordCard(turnId, cardId, sent.messageId);
-        return sent;
+        return client.sendTrackedCard(getChannel(), chatId, cardId, replyToMessageId, replyInThread);
       },
       async updateElement(cardId, elementId, content, sequence) {
         await client.journal?.reserveSequence(turnId, cardId, sequence);
