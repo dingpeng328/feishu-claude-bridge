@@ -963,7 +963,9 @@ export class ChannelClient {
       this.staleTimer = setInterval(() => {
         if (this.shouldRebuild(staleMs, cooldownMs, refreshMs, Date.now())) void this.rebuildChannel();
       }, STALE_CHECK_INTERVAL_MS);
-      this.staleTimer.unref();
+      // This is a long-running service: keep the watchdog referenced even when
+      // the SDK temporarily owns no socket (e.g. after a failed handshake).
+      // An unresolved events() Promise alone does not keep Node alive.
     }
 
     if (this.catchUpTimer) clearInterval(this.catchUpTimer);
@@ -997,7 +999,9 @@ export class ChannelClient {
       this.reconnectTimer = undefined;
       if (!this.closed) void this.rebuildChannel();
     }, delay);
-    this.reconnectTimer.unref();
+    // A failed initial connect may leave this as the only live handle. unref()
+    // would let Node exit successfully before the promised retry ever runs.
+    // close() cancels it so deliberate shutdown still exits normally.
   }
 
   /** Called only after agent execution has stopped; retries delivery, never execution. */
@@ -1312,7 +1316,7 @@ export class ChannelClient {
       if (this.closed) return;
       await this.connectChannel(); // re-handshake, re-subscribe, re-arm watchdog
     } catch (e) {
-      log(`channel rebuild failed (will retry next tick): ${e instanceof Error ? e.message : String(e)}`);
+      log(`channel rebuild failed; scheduling retry: ${safeErrorMessage(e)}`);
       this.scheduleReconnect();
     } finally {
       this.rebuilding = false;
